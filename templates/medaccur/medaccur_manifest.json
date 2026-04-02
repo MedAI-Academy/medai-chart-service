@@ -1,0 +1,173 @@
+{
+  "version": "4.0",
+  "engine": "medaccur-clone-swap",
+  "description": "25 individual template slides \u2014 all with {{placeholders}}, data-driven charts rendered as PNG by Chart Service.",
+  "layout_map": {
+    "TITLE": {
+      "file": "Title.pptx",
+      "slide": 1
+    },
+    "SECTION_DIVIDER": {
+      "file": "Divider.pptx",
+      "slide": 1
+    },
+    "EXECUTIVE_SUMMARY": {
+      "file": "Exec_Sum.pptx",
+      "slide": 1
+    },
+    "COMPETITIVE_LANDSCAPE": {
+      "file": "Comp_Landscape.pptx",
+      "slide": 1
+    },
+    "PIVOTAL_STUDIES": {
+      "file": "Pivotal_Study.pptx",
+      "slide": 1
+    },
+    "FOREST_PLOT": {
+      "file": "Forrest_Plot.pptx",
+      "slide": 1
+    },
+    "SWIMMER_PLOT": {
+      "file": "Swimmer_Plot.pptx",
+      "slide": 1
+    },
+    "KM_CURVE": {
+      "file": "KM_Curve.pptx",
+      "slide": 1
+    },
+    "DISEASE_OVERVIEW": {
+      "file": "medaccur_disease.pptx",
+      "slide": 1
+    },
+    "SCIENTIFIC_NARRATIVE": {
+      "file": "medaccur_narrative.pptx",
+      "slide": 1
+    },
+    "SWOT_CLASSIC": {
+      "file": "SWOT_1.pptx",
+      "slide": 1
+    },
+    "SWOT_HORIZONTAL": {
+      "file": "SWOT_2.pptx",
+      "slide": 1
+    },
+    "SWOT_DIAMOND": {
+      "file": "medaccur_swot_new.pptx",
+      "slide": 1
+    },
+    "PREVALENCE_KPI": {
+      "file": "medaccur_prevalence_kpi.pptx",
+      "slide": 1
+    },
+    "GUIDELINES_TABLE": {
+      "file": "medaccur_guidelines_table.pptx",
+      "slide": 1
+    },
+    "UNMET_NEEDS": {
+      "file": "medaccur_unmet_needs.pptx",
+      "slide": 1
+    },
+    "MARKET_ACCESS": {
+      "file": "medaccur_market_access.pptx",
+      "slide": 1
+    },
+    "WATERFALL_PLOT": {
+      "file": "medaccur_waterfall_plot.pptx",
+      "slide": 1
+    },
+    "IMPERATIVES_TEMPLE_3": {
+      "file": "SI_3_Columns.pptx",
+      "slide": 1
+    },
+    "IMPERATIVES_TEMPLE_4": {
+      "file": "SI_4_columns.pptx",
+      "slide": 1
+    },
+    "IMPERATIVES_TEMPLE_5": {
+      "file": "SI_5_columns.pptx",
+      "slide": 1
+    },
+    "IMPERATIVES_NUMBERED_4": {
+      "file": "SI_4_Zeilen.pptx",
+      "slide": 1
+    },
+    "TACTICAL_PLAN_6": {
+      "file": "Tactical_Timeline_6Bereiche.pptx",
+      "slide": 1
+    },
+    "TACTICAL_PLAN_4": {
+      "file": "Tactical_Timeline_Plan_4_Zeilen.pptx",
+      "slide": 1
+    },
+    "TACTICAL_PLAN_8": {
+      "file": "Tactical_Timeline_Plan_8_Zeilen.pptx",
+      "slide": 1
+    },
+    "COMPETITIVE_REGULATORY": {
+      "file": "Comp_Regulatory.pptx",
+      "slide": 1
+    },
+    "COMPETITIVE_H2H": {
+      "file": "Comp_HeadToHead.pptx",
+      "slide": 1
+    }
+  },
+  "section_to_layout": {
+    "disease_intro": "DISEASE_OVERVIEW",
+    "prevalence": "PREVALENCE_KPI",
+    "treatment_landscape": "COMPETITIVE_LANDSCAPE",
+    "guidelines": "GUIDELINES_TABLE",
+    "unmet_needs": "UNMET_NEEDS",
+    "mode_of_action": "SCIENTIFIC_NARRATIVE",
+    "pivotal_studies": "PIVOTAL_STUDIES",
+    "subgroup_analysis": "FOREST_PLOT",
+    "competitive_landscape": "COMPETITIVE_LANDSCAPE",
+    "market_access": "MARKET_ACCESS",
+    "narrative": "SCIENTIFIC_NARRATIVE",
+    "differentiators": "DISEASE_OVERVIEW",
+    "iep": "GUIDELINES_TABLE",
+    "swot": "_AUTO_SELECT_SWOT_",
+    "strategic_imperatives": "_AUTO_SELECT_IMPERATIVES_",
+    "tactical_plan": "_AUTO_SELECT_TACTICAL_",
+    "areas_interest": "DISEASE_OVERVIEW",
+    "timeline": "TACTICAL_PLAN_4",
+    "executive_summary": "EXECUTIVE_SUMMARY",
+    "summary": "EXECUTIVE_SUMMARY",
+    "km_curve": "KM_CURVE"
+  },
+  "auto_select_rules": {
+    "strategic_imperatives": {
+      "3_pillars": "IMPERATIVES_TEMPLE_3",
+      "4_pillars": "IMPERATIVES_TEMPLE_4",
+      "5_pillars": "IMPERATIVES_TEMPLE_5",
+      "fallback": "IMPERATIVES_TEMPLE_4"
+    },
+    "tactical_plan": {
+      "4_or_fewer": "TACTICAL_PLAN_4",
+      "5_to_6": "TACTICAL_PLAN_6",
+      "7_or_more": "TACTICAL_PLAN_8",
+      "fallback": "TACTICAL_PLAN_6"
+    },
+    "swot": {
+      "default": "SWOT_CLASSIC",
+      "alternatives": [
+        "SWOT_HORIZONTAL",
+        "SWOT_DIAMOND"
+      ]
+    }
+  },
+  "chart_service": {
+    "description": "Data-driven slides use Chart Service to render PNG images",
+    "charts": {
+      "KM_CURVE": "POST /charts/kaplan-meier \u2192 PNG embedded in KM_Curve template",
+      "FOREST_PLOT": "POST /charts/forest-plot \u2192 PNG embedded in Forrest_Plot template",
+      "SWIMMER_PLOT": "POST /charts/swimmer-plot \u2192 PNG embedded in Swimmer_Plot template",
+      "WATERFALL_PLOT": "POST /charts/waterfall \u2192 PNG embedded in waterfall template",
+      "PIVOTAL_BAR": "POST /charts/bar-chart \u2192 PNG embedded in Pivotal_Study template",
+      "TACTICAL_GANTT": "POST /charts/gantt \u2192 PNG embedded in Tactical templates"
+    }
+  },
+  "total_layouts": 27,
+  "total_files": 25,
+  "slide_dimensions": "13.33in x 7.50in"
+}
