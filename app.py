@@ -1,25 +1,30 @@
 """
-MedAI Chart Service — Publication-Quality Scientific Charts
-FastAPI microservice for generating NEJM/Lancet-grade chart PNGs.
+MedAI Chart Service — Publication-Quality Scientific Charts + PPTX Deck Renderer
+FastAPI microservice on Railway.
 
 Endpoints:
   POST /charts/kaplan-meier   → KM survival curve PNG
-  POST /charts/forest-plot    → Forest plot PNG  (coming soon)
-  POST /charts/waterfall      → Waterfall chart PNG (coming soon)
-  POST /charts/swimmer        → Swimmer plot PNG (coming soon)
-  GET  /health                → Health check
+  POST /render-deck           → Complete PPTX from recipe JSON + templates
+  GET  /render-deck/health    → Deck renderer health check
+  GET  /health                → General health check
 """
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import io
+import os
+import traceback
+import logging
 import numpy as np
 
 from charts.kaplan_meier import render_kaplan_meier
 
-app = FastAPI(title="MedAI Chart Service", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="MedAI Chart Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,14 +58,92 @@ class KMRequest(BaseModel):
     dpi: int = Field(300, description="Resolution")
 
 
-# ── Endpoints ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# CHART ENDPOINTS
+# ══════════════════════════════════════════════════════════════════
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0", "engine": "FastAPI + python-pptx"}
 
 
 @app.post("/charts/kaplan-meier")
 def kaplan_meier(req: KMRequest):
     buf = render_kaplan_meier(req)
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ══════════════════════════════════════════════════════════════════
+# DECK RENDERER — Template Clone+Swap + Native Shapes
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/render-deck/health")
+def deck_health():
+    """Health check for deck renderer — shows template count and manifest."""
+    try:
+        from deck_renderer import load_manifest, TEMPLATE_DIR
+        manifest = load_manifest()
+        td = TEMPLATE_DIR
+        tc = len([f for f in os.listdir(td) if f.endswith('.pptx')]) if os.path.isdir(td) else 0
+        return {
+            "status": "ok",
+            "engine": "python-pptx + native shapes",
+            "template_dir": td,
+            "templates_found": tc,
+            "manifest_version": manifest.get('version', '?') if manifest else 'none',
+            "manifest_layouts": len(manifest.get('layout_map', {})) if manifest else 0
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/render-deck")
+async def render_deck_endpoint(request: Request):
+    """
+    POST /render-deck — Render a complete PPTX from recipe JSON.
+
+    Uses medaccur templates with {{placeholder}} replacement.
+    Adds native PowerPoint shapes for Forest Plot, Waterfall, Swimmer, ORR bars.
+    KM curves rendered as matplotlib PNG (only exception).
+    """
+    try:
+        recipe = await request.json()
+        if not recipe:
+            return JSONResponse({"error": "No JSON body"}, status_code=400)
+        if 'slides' not in recipe:
+            return JSONResponse({"error": "Missing 'slides' in recipe"}, status_code=400)
+
+        from deck_renderer import render_deck, load_manifest
+        from charts.shape_renderer import add_chart_shapes
+        from charts.chart_renderer import render_chart
+
+        load_manifest()
+
+        pptx_buf = render_deck(
+            recipe,
+            chart_renderer=render_chart,
+            shape_renderer=add_chart_shapes
+        )
+
+        meta = recipe.get('metadata', {})
+        drug = meta.get('drug', 'MAP').replace(' ', '_')
+        country = meta.get('country', 'EMEA').replace(' ', '_')
+        year = meta.get('year', '2027')
+        filename = f"{drug}_MAP_{country}_{year}.pptx"
+
+        return Response(
+            content=pptx_buf.read(),
+            media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Access-Control-Allow-Origin': '*',
+            }
+        )
+
+    except ValueError as ve:
+        logger.error(f"Validation error: {ve}")
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"Deck render error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
