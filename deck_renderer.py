@@ -135,6 +135,34 @@ def replace_unfilled_placeholders(slide):
                     run.text = ''
 
 
+def enable_auto_shrink(slide):
+    """
+    Enable text auto-shrink (normAutofit) on ALL text shapes in a slide.
+    This prevents text from overflowing shape boundaries by automatically
+    reducing font size to fit. Critical for AI-generated text which is
+    often longer than the template placeholders expected.
+    """
+    from lxml import etree
+    ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    count = 0
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        body_pr = shape.text_frame._txBody.find(f'{{{ns}}}bodyPr')
+        if body_pr is None:
+            continue
+        # Remove any existing autofit settings
+        for child in list(body_pr):
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag in ('normAutofit', 'spAutoFit', 'noAutofit'):
+                body_pr.remove(child)
+        # Add normAutofit (shrink text to fit)
+        autofit = etree.SubElement(body_pr, f'{{{ns}}}normAutofit')
+        autofit.set('fontScale', '50000')  # Allow shrinking down to 50%
+        count += 1
+    return count
+
+
 def embed_png_in_slide(slide, prs, png_bytes, left, top, width, height):
     """Embed a PNG image into a slide at the given position (in inches)."""
     from pptx.util import Inches as In
@@ -293,6 +321,9 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
             # ── Step 1: Replace {{placeholders}} ──
             replace_placeholders(template_slide, content)
             replace_unfilled_placeholders(template_slide)
+
+            # ── Step 1b: Auto-shrink text to prevent overflow ──
+            shrunk = enable_auto_shrink(template_slide)
 
             # ── Step 2: Apply theme color swap ──
             if color_swap:
