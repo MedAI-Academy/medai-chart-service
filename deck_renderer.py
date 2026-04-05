@@ -158,7 +158,7 @@ def enable_auto_shrink(slide):
                 body_pr.remove(child)
         # Add normAutofit (shrink text to fit)
         autofit = etree.SubElement(body_pr, f'{{{ns}}}normAutofit')
-        autofit.set('fontScale', '50000')  # Allow shrinking down to 50%
+        autofit.set('fontScale', '75000')  # Allow shrinking down to 75%
         count += 1
     return count
 
