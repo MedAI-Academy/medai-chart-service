@@ -5,11 +5,13 @@ Assembles a complete PPTX from:
   1. Recipe JSON (ordered list of {layout, content})
   2. Template PPTX files (25 medaccur templates with {{placeholders}})
   3. Chart PNGs rendered inline for data-driven slides
+  4. Theme color swapping for Light/Dark/Teal/Slate variants
 
 Flow:
   - For each slide in recipe:
     - Open the correct template PPTX
     - Replace {{placeholders}} in all text shapes
+    - Apply theme color swap (if not default dark theme)
     - For chart slides: render chart PNG, embed at chart_area position
     - Append the processed slide to the output PPTX
 """
@@ -23,6 +25,8 @@ from pathlib import Path
 from pptx import Presentation
 from pptx.util import Inches, Emu
 from lxml import etree
+
+from theme_patch import apply_theme
 
 logger = logging.getLogger(__name__)
 
@@ -185,13 +189,38 @@ def copy_slide_xml(source_prs, source_slide, target_prs):
     return target_slide
 
 
+def render_km_from_content(content):
+    """
+    Render KM curve PNG from km_data in slide content.
+    Uses charts/km_curve.py if available, returns PNG bytes or None.
+    """
+    km_data = content.get('km_data')
+    if not km_data:
+        return None
+    if not km_data.get('arms'):
+        return None
+
+    try:
+        from charts.km_curve import render_km_curve
+        png_bytes = render_km_curve(km_data)
+        logger.info(f"  KM curve rendered: {len(png_bytes)} bytes, {len(km_data['arms'])} arms")
+        return png_bytes
+    except ImportError:
+        logger.warning("  charts/km_curve.py not available — KM curve skipped")
+        return None
+    except Exception as e:
+        logger.warning(f"  KM curve render failed: {e}")
+        return None
+
+
 def render_deck(recipe, chart_renderer=None, shape_renderer=None):
     """
     Build a complete PPTX from recipe JSON + templates.
     
     Args:
-        recipe: dict with 'metadata', 'slides' (list of {id, layout, content})
-        chart_renderer: optional callable(layout, content) -> bytes (PNG) — for KM curves only
+        recipe: dict with 'metadata', 'slides' (list of {id, layout, content}),
+                optional 'theme' with 'color_swap' dict
+        chart_renderer: optional callable(layout, content) -> bytes (PNG) — for KM curves
         shape_renderer: optional callable(slide, layout, content) -> int — for native shapes
     
     Returns:
@@ -202,6 +231,15 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
 
     metadata = recipe.get('metadata', {})
     slides = recipe.get('slides', [])
+
+    # ── Theme: read color swap map ──
+    theme = recipe.get('theme', {})
+    color_swap = theme.get('color_swap', {})
+    theme_id = theme.get('id', 'dark')
+    if color_swap:
+        logger.info(f"Theme: {theme.get('name', theme_id)} — {len(color_swap)} color swaps")
+    else:
+        logger.info(f"Theme: default (no color swaps)")
 
     if not slides:
         raise ValueError("Recipe has no slides")
@@ -218,12 +256,12 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
         'FOREST_PLOT', 'WATERFALL_PLOT', 'SWIMMER_PLOT', 'PIVOTAL_STUDIES',
     }
     PNG_LAYOUTS = {
-        'KM_CURVE',  # Only KM uses matplotlib PNG (curves too complex for shapes)
+        'KM_CURVE',  # KM uses matplotlib PNG (curves too complex for shapes)
     }
 
     # Chart area position for KM PNG embedding
     CHART_AREAS = {
-        'KM_CURVE': {'left': 0.5, 'top': 2.0, 'width': 12.3, 'height': 4.8},
+        'KM_CURVE': {'left': 0.5, 'top': 1.8, 'width': 12.3, 'height': 4.5},
     }
 
     slides_added = 0
@@ -252,15 +290,19 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
                 continue
             template_slide = template_prs.slides[0]
 
-            # ── Replace {{placeholders}} ──
+            # ── Step 1: Replace {{placeholders}} ──
             replace_placeholders(template_slide, content)
             replace_unfilled_placeholders(template_slide)
 
-            # ── Copy processed slide to output ──
+            # ── Step 2: Apply theme color swap ──
+            if color_swap:
+                apply_theme(template_slide, color_swap)
+
+            # ── Step 3: Copy processed slide to output ──
             output_slide = copy_slide_xml(template_prs, template_slide, output)
             slides_added += 1
 
-            # ── Native shapes (Forest, Waterfall, Swimmer, ORR bars) ──
+            # ── Step 4: Native shapes (Forest, Waterfall, Swimmer, ORR bars) ──
             if layout in SHAPE_LAYOUTS and shape_renderer:
                 try:
                     added = shape_renderer(output_slide, layout, content)
@@ -269,19 +311,28 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
                 except Exception as shape_err:
                     logger.warning(f"  Shape rendering failed for {layout}: {shape_err}")
 
-            # ── KM curve PNG (only exception) ──
-            if layout in PNG_LAYOUTS and chart_renderer:
-                try:
-                    chart_png = chart_renderer(layout, content)
-                    if chart_png:
-                        area = CHART_AREAS.get(layout, {'left': 0.5, 'top': 2.0, 'width': 12.3, 'height': 4.8})
-                        embed_png_in_slide(
-                            output_slide, output, chart_png,
-                            area['left'], area['top'], area['width'], area['height']
-                        )
-                        logger.info(f"  KM PNG embedded for {layout}")
-                except Exception as chart_err:
-                    logger.warning(f"  KM rendering failed for {layout}: {chart_err}")
+            # ── Step 5: KM curve PNG ──
+            if layout in PNG_LAYOUTS:
+                km_png = None
+
+                # Try 1: Render from km_data in content (auto-extracted or manual)
+                km_png = render_km_from_content(content)
+
+                # Try 2: Use chart_renderer callback (legacy)
+                if not km_png and chart_renderer:
+                    try:
+                        km_png = chart_renderer(layout, content)
+                    except Exception as chart_err:
+                        logger.warning(f"  Chart renderer failed for {layout}: {chart_err}")
+
+                # Embed PNG if we got one
+                if km_png:
+                    area = CHART_AREAS.get(layout, {'left': 0.5, 'top': 1.8, 'width': 12.3, 'height': 4.5})
+                    embed_png_in_slide(
+                        output_slide, output, km_png,
+                        area['left'], area['top'], area['width'], area['height']
+                    )
+                    logger.info(f"  KM PNG embedded for {layout}")
 
             logger.info(f"  [{slides_added}/{len(slides)}] {slide_id} → {layout}")
 
@@ -292,7 +343,7 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
     if slides_added == 0:
         raise ValueError("No slides were successfully rendered")
 
-    logger.info(f"Deck complete: {slides_added} slides")
+    logger.info(f"Deck complete: {slides_added} slides, theme: {theme_id}")
 
     # ── Save to BytesIO ──
     buf = io.BytesIO()
