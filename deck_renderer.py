@@ -284,12 +284,15 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
         'FOREST_PLOT', 'WATERFALL_PLOT', 'SWIMMER_PLOT', 'PIVOTAL_STUDIES',
     }
     PNG_LAYOUTS = {
-        'KM_CURVE',  # KM uses matplotlib PNG (curves too complex for shapes)
+        'KM_CURVE',
+        'TACTICAL_PLAN_4', 'TACTICAL_PLAN_6', 'TACTICAL_PLAN_8',
     }
 
-    # Chart area position for KM PNG embedding
     CHART_AREAS = {
-        'KM_CURVE': {'left': 0.5, 'top': 1.8, 'width': 12.3, 'height': 4.5},
+        'KM_CURVE':        {'left': 0.5,  'top': 1.8, 'width': 12.3, 'height': 4.5},
+        'TACTICAL_PLAN_4': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
+        'TACTICAL_PLAN_6': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
+        'TACTICAL_PLAN_8': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
     }
 
     slides_added = 0
@@ -342,28 +345,29 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
                 except Exception as shape_err:
                     logger.warning(f"  Shape rendering failed for {layout}: {shape_err}")
 
-            # ── Step 5: KM curve PNG ──
+            # ── Step 5: PNG charts (KM, Gantt, etc.) ──
             if layout in PNG_LAYOUTS:
-                km_png = None
+                chart_png = None
 
-                # Try 1: Render from km_data in content (auto-extracted or manual)
-                km_png = render_km_from_content(content)
+                # Try 1: KM from extracted data
+                if layout == 'KM_CURVE':
+                    chart_png = render_km_from_content(content)
 
-                # Try 2: Use chart_renderer callback (legacy)
-                if not km_png and chart_renderer:
+                # Try 2: chart_renderer (Gantt, KM fallback, etc.)
+                if not chart_png and chart_renderer:
                     try:
-                        km_png = chart_renderer(layout, content)
+                        chart_png = chart_renderer(layout, content)
                     except Exception as chart_err:
                         logger.warning(f"  Chart renderer failed for {layout}: {chart_err}")
 
                 # Embed PNG if we got one
-                if km_png:
+                if chart_png:
                     area = CHART_AREAS.get(layout, {'left': 0.5, 'top': 1.8, 'width': 12.3, 'height': 4.5})
                     embed_png_in_slide(
-                        output_slide, output, km_png,
+                        output_slide, output, chart_png,
                         area['left'], area['top'], area['width'], area['height']
                     )
-                    logger.info(f"  KM PNG embedded for {layout}")
+                    logger.info(f"  Chart PNG embedded for {layout}")
 
             logger.info(f"  [{slides_added}/{len(slides)}] {slide_id} → {layout}")
 
