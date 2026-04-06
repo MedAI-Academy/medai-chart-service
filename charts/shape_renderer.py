@@ -99,7 +99,16 @@ def add_forest_plot_shapes(slide, content):
 
     shapes_added = 0
     for prefix, y_pos in rows:
-        hr = _parse_num(content.get(prefix + '_hr'))
+        hr_raw = content.get(prefix + '_hr', '')
+        # Strip "HR " / "Hazard Ratio " prefix: "HR 0.54 (0.15-1.95)" → "0.54"
+        import re as _re
+        hr_cleaned = _re.sub(r'^(HR|Hazard Ratio)\s*', '', str(hr_raw), flags=_re.IGNORECASE).strip()
+        hr_match = _re.match(r'[\d.]+', hr_cleaned)
+        hr = float(hr_match.group()) if hr_match else None
+        # Auto-extract CI from parentheses if not separately provided
+        ci_in_parens = _re.search(r'\(([^)]+)\)', str(hr_raw))
+        if ci_in_parens and not content.get(prefix + '_ci'):
+            content[prefix + '_ci'] = ci_in_parens.group(1)
         if hr is None or hr <= 0 or hr > 5:
             continue
 

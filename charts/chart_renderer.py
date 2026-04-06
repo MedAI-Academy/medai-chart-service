@@ -268,38 +268,93 @@ def render_gantt_chart(content):
     """Render Gantt chart for tactical plan / timeline."""
     setup_style()
 
-    rows = content.get('workstreams', content.get('activities', content.get('rows', [])))
+    # Get raw tactical rows (passed through from flattenContent)
+    rows = content.get('_raw_tactical_rows', content.get('workstreams',
+           content.get('activities', content.get('rows', []))))
     if not rows:
         return None
 
-    fig, ax = plt.subplots(figsize=(11, max(2.5, len(rows) * 0.45 + 0.5)))
+    MONTH_MAP = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+                 'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
 
-    # Parse timeline data
-    for i, row in enumerate(reversed(rows[:10])):  # max 10 workstreams
-        name = row.get('name', row.get('workstream', row.get('activity', f'WS {i+1}')))
-        start = _parse_num(row.get('start_month', row.get('start', i * 2)))
-        end = _parse_num(row.get('end_month', row.get('end', start + 6)))
-        if end <= start:
-            end = start + 3
-        color = COLORS[i % len(COLORS)]
+    def month_to_num(m):
+        if isinstance(m, (int, float)): return int(m)
+        return MONTH_MAP.get(str(m).lower().strip()[:3], 0)
 
-        ax.barh(i, end - start, left=start, height=0.5, color=color,
-                edgecolor='white', linewidth=0.5, alpha=0.85, zorder=2)
-        ax.text(start + (end - start) / 2, i, name[:30],
-                ha='center', va='center', fontsize=7, fontweight='bold',
-                color='white' if _is_dark(color) else DARK, zorder=3)
+    # Group by workstream type
+    ws_map = {}
+    ws_order = []
+    for r in rows:
+        ws_name = r.get('type', r.get('workstream', r.get('name', 'General')))
+        if ws_name not in ws_map:
+            ws_map[ws_name] = []
+            ws_order.append(ws_name)
+        ws_map[ws_name].append(r)
 
-    # Month labels on x-axis
-    max_month = max([_parse_num(r.get('end_month', r.get('end', 12))) for r in rows] + [12])
-    ax.set_xlim(0, max_month + 1)
-    month_labels = [f'M{m}' for m in range(0, int(max_month) + 2, 3)]
-    ax.set_xticks(range(0, int(max_month) + 2, 3))
-    ax.set_xticklabels(month_labels, fontsize=8)
-    ax.set_xlabel('Timeline', fontsize=10, fontweight='bold')
+    # Build visual rows: one per tactic, grouped by workstream
+    gantt_rows = []
+    for ws_name in ws_order:
+        tactics = ws_map[ws_name]
+        for ti, tac in enumerate(tactics):
+            months = tac.get('months', [])
+            if months:
+                start = month_to_num(months[0])
+                end = month_to_num(months[-1])
+            else:
+                start = _parse_num(tac.get('start_month', tac.get('start', 1))) or 1
+                end = _parse_num(tac.get('end_month', tac.get('end', start + 3))) or (start + 3)
+            if end < start: end = start + 1
+
+            gantt_rows.append({
+                'ws': ws_name,
+                'tactic': tac.get('tactic', tac.get('name', '')),
+                'start': start,
+                'end': end + 1,
+                'is_first': ti == 0,
+            })
+
+    if not gantt_rows:
+        return None
+
+    n = len(gantt_rows)
+    fig_h = max(3.5, n * 0.4 + 1.5)
+    fig, ax = plt.subplots(figsize=(11, fig_h))
+
+    ws_colors = {}
+    for i, ws in enumerate(ws_order):
+        ws_colors[ws] = COLORS[i % len(COLORS)]
+
+    for i, row in enumerate(reversed(gantt_rows)):
+        y = i
+        color = ws_colors[row['ws']]
+        duration = row['end'] - row['start']
+
+        ax.barh(y, duration, left=row['start'] - 0.5, height=0.55,
+                color=color, edgecolor='white', linewidth=0.5, alpha=0.85, zorder=2)
+
+        tactic_text = row['tactic'][:35]
+        if duration >= 3 and tactic_text:
+            ax.text(row['start'] + duration/2 - 0.5, y, tactic_text,
+                    ha='center', va='center', fontsize=6.5, fontweight='bold',
+                    color='white' if _is_dark(color) else DARK, zorder=3)
+
+        if row['is_first']:
+            ax.text(-0.3, y, row['ws'][:20], ha='right', va='center',
+                    fontsize=8, fontweight='bold', color=DARK)
+
+    ax.set_xlim(0.5, 12.5)
+    ax.set_xticks(range(1, 13))
+    ax.set_xticklabels(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], fontsize=8)
+
+    for q_start, q_label, q_color in [(1,'Q1','#F5F3FF'),(4,'Q2','#EEF2FF'),(7,'Q3','#DBEAFE'),(10,'Q4','#E0F2FE')]:
+        ax.axvspan(q_start - 0.5, q_start + 2.5, color=q_color, alpha=0.3, zorder=0)
+        ax.text(q_start + 1, len(gantt_rows) + 0.3, q_label, ha='center',
+                fontsize=9, fontweight='bold', color='#64748B')
+
     ax.set_yticks([])
-    ax.grid(axis='x', alpha=0.3, zorder=0)
-
-    fig.subplots_adjust(left=0.05)
+    ax.spines['left'].set_visible(False)
+    ax.grid(axis='x', alpha=0.2, zorder=0)
+    fig.subplots_adjust(left=0.2, right=0.95, top=0.90, bottom=0.12)
     return fig_to_png(fig)
 
 
