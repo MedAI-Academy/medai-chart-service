@@ -101,6 +101,7 @@ def apply_theme(slide, color_swap: dict):
         swapped += _apply_fills(shape, all_fill)
         swapped += _apply_text(shape, all_text)
         swapped += _apply_lines(shape, color_swap)  # lines use full map
+        swapped += _hide_dark_borders(shape)  # remove borders visible on light bg
         
         if shape.has_table:
             for row in shape.table.rows:
@@ -116,6 +117,7 @@ def apply_theme(slide, color_swap: dict):
                     swapped += _apply_fills(child, all_fill)
                     swapped += _apply_text(child, all_text)
                     swapped += _apply_lines(child, color_swap)
+                    swapped += _hide_dark_borders(child)
         except Exception:
             pass
     
@@ -223,6 +225,44 @@ def _apply_lines(shape, swap_map: dict) -> int:
             if new:
                 line.color.rgb = hex_to_rgb(new)
                 swapped += 1
+    except:
+        pass
+    return swapped
+
+
+def _hide_dark_borders(shape) -> int:
+    """
+    On light themes, thin dark borders that were invisible on dark backgrounds
+    become ugly visible lines. Make them transparent or very light.
+    """
+    swapped = 0
+    try:
+        line = shape.line
+        # Only affect thin borders (≤ 1.5pt = 19050 EMU)
+        if line.width is not None and line.width <= 19050:
+            try:
+                if line.color and line.color.rgb:
+                    h = rgb_to_hex(line.color.rgb)
+                    lum = luminance(h)
+                    if lum < 350:  # dark border
+                        line.color.rgb = hex_to_rgb('E2E8F0')  # light gray
+                        swapped += 1
+            except:
+                # No explicit color — check via XML
+                try:
+                    from lxml import etree
+                    ln = shape._element.find(f'.//{{{NS}}}ln')
+                    if ln is not None:
+                        sf = ln.find(f'{{{NS}}}solidFill')
+                        if sf is not None:
+                            srgb = sf.find(f'{{{NS}}}srgbClr')
+                            if srgb is not None:
+                                h = srgb.get('val', '').upper()
+                                if luminance(h) < 350:
+                                    srgb.set('val', 'E2E8F0')
+                                    swapped += 1
+                except:
+                    pass
     except:
         pass
     return swapped
