@@ -26,7 +26,9 @@ from pptx import Presentation
 from pptx.util import Inches, Emu
 from lxml import etree
 
-from theme_patch import apply_theme
+## DISABLED: theme_patch destroys template colors (white text on white bg, black borders)
+## Templates are already correctly designed as light theme. DO NOT RE-ENABLE.
+## from theme_patch import apply_theme
 
 logger = logging.getLogger(__name__)
 
@@ -282,17 +284,14 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
     # Track which layouts need native shapes vs PNG
     SHAPE_LAYOUTS = {
         'FOREST_PLOT', 'WATERFALL_PLOT', 'SWIMMER_PLOT', 'PIVOTAL_STUDIES',
+        'TACTICAL_PLAN_4', 'TACTICAL_PLAN_6', 'TACTICAL_PLAN_8',
     }
     PNG_LAYOUTS = {
         'KM_CURVE',
-        'TACTICAL_PLAN_4', 'TACTICAL_PLAN_6', 'TACTICAL_PLAN_8',
     }
 
     CHART_AREAS = {
         'KM_CURVE':        {'left': 0.5,  'top': 1.8, 'width': 12.3, 'height': 4.5},
-        'TACTICAL_PLAN_4': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
-        'TACTICAL_PLAN_6': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
-        'TACTICAL_PLAN_8': {'left': 1.6,  'top': 1.0, 'width': 11.2, 'height': 5.5},
     }
 
     slides_added = 0
@@ -328,9 +327,10 @@ def render_deck(recipe, chart_renderer=None, shape_renderer=None):
             # ── Step 1b: Auto-shrink text to prevent overflow ──
             shrunk = enable_auto_shrink(template_slide)
 
-            # ── Step 2: Apply theme color swap ──
-            if color_swap:
-                apply_theme(template_slide, color_swap)
+            # ── Step 2: Theme color swap DISABLED ──
+            # Templates are already light-themed. theme_patch broke colors.
+            # if color_swap:
+            #     apply_theme(template_slide, color_swap)
 
             # ── Step 3: Copy processed slide to output ──
             output_slide = copy_slide_xml(template_prs, template_slide, output)
