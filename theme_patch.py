@@ -213,13 +213,12 @@ def _apply_text_frame(tf, swap_map: dict) -> int:
 
 
 def _apply_lines(shape, swap_map: dict) -> int:
-    """Swap line/border colors (use full map)."""
+    """Swap line/border colors — ONLY if line already has an explicit color."""
     swapped = 0
     try:
         line = shape.line
-        if line.fill and line.fill.type is not None:
-            swapped += _swap_fill(line.fill, swap_map)
-        elif line.color and line.color.rgb:
+        # Only touch lines that have an EXPLICIT color set
+        if line.color and line.color.rgb:
             h = rgb_to_hex(line.color.rgb)
             new = _find_swap(h, swap_map)
             if new:
@@ -232,37 +231,31 @@ def _apply_lines(shape, swap_map: dict) -> int:
 
 def _hide_dark_borders(shape) -> int:
     """
-    On light themes, thin dark borders that were invisible on dark backgrounds
-    become ugly visible lines. Make them transparent or very light.
+    On light themes, dark borders become ugly visible lines.
+    Set them to noFill (transparent) via raw XML — safest approach.
     """
     swapped = 0
     try:
-        line = shape.line
-        # Only affect thin borders (≤ 1.5pt = 19050 EMU)
-        if line.width is not None and line.width <= 19050:
-            try:
-                if line.color and line.color.rgb:
-                    h = rgb_to_hex(line.color.rgb)
-                    lum = luminance(h)
-                    if lum < 350:  # dark border
-                        line.color.rgb = hex_to_rgb('E2E8F0')  # light gray
+        ln = shape._element.find(f'.//{{{NS}}}ln')
+        if ln is not None:
+            # Check if this line has a dark solid fill
+            sf = ln.find(f'{{{NS}}}solidFill')
+            if sf is not None:
+                srgb = sf.find(f'{{{NS}}}srgbClr')
+                if srgb is not None:
+                    h = srgb.get('val', '').upper()
+                    if luminance(h) < 350:
+                        # Replace solidFill with noFill
+                        ln.remove(sf)
+                        from lxml import etree
+                        etree.SubElement(ln, f'{{{NS}}}noFill')
                         swapped += 1
-            except:
-                # No explicit color — check via XML
-                try:
+                elif len(sf) == 0:
+                    # Empty <a:solidFill/> tag — renders as black, remove it
+                    ln.remove(sf)
                     from lxml import etree
-                    ln = shape._element.find(f'.//{{{NS}}}ln')
-                    if ln is not None:
-                        sf = ln.find(f'{{{NS}}}solidFill')
-                        if sf is not None:
-                            srgb = sf.find(f'{{{NS}}}srgbClr')
-                            if srgb is not None:
-                                h = srgb.get('val', '').upper()
-                                if luminance(h) < 350:
-                                    srgb.set('val', 'E2E8F0')
-                                    swapped += 1
-                except:
-                    pass
+                    etree.SubElement(ln, f'{{{NS}}}noFill')
+                    swapped += 1
     except:
         pass
     return swapped
