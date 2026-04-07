@@ -469,6 +469,211 @@ def add_orr_bars(slide, content):
 
 
 # ═══════════════════════════════════════════════════════
+# GANTT CHART — Native PPTX Shapes for Tactical Plan
+# ═══════════════════════════════════════════════════════
+GANTT_COLORS = [PURPLE, TEAL, RGBColor(0x3B, 0x82, 0xF6), GOLD, ROSE, SLATE]
+MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+MONTH_MAP = {'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,
+             'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12,
+             'q1':1,'q2':4,'q3':7,'q4':10}
+
+def _month_num(m):
+    if isinstance(m, (int, float)): return max(1, min(12, int(m)))
+    s = str(m).lower().strip()[:3]
+    return MONTH_MAP.get(s, 0)
+
+def _parse_timeframe(tf):
+    """Parse timeframe string like 'Q1-Q2', 'Jan-Mar', 'Q3' into (start_month, end_month)."""
+    if not tf: return 1, 3
+    s = str(tf).strip()
+    import re as _re
+    # Try "Q1-Q3" or "Q2"
+    qm = _re.findall(r'Q([1-4])', s, _re.IGNORECASE)
+    if qm:
+        starts = [int(q)*3-2 for q in qm]
+        ends = [int(q)*3 for q in qm]
+        return min(starts), max(ends)
+    # Try month names "Jan-Jun"
+    mm = _re.findall(r'[A-Za-z]{3,}', s)
+    if mm:
+        nums = [_month_num(m) for m in mm]
+        nums = [n for n in nums if n > 0]
+        if nums: return min(nums), max(nums)
+    # Try numeric "1-6"
+    nm = _re.findall(r'\d+', s)
+    if nm:
+        nums = [int(n) for n in nm if 1 <= int(n) <= 12]
+        if nums: return min(nums), max(nums)
+    return 1, 3
+
+def add_gantt_shapes(slide, content):
+    """
+    Add native Gantt bars to tactical plan slide.
+    Renders workstream labels, monthly bars with Q-shading, tactic names inside bars.
+    """
+    rows = content.get('_raw_tactical_rows', content.get('workstreams',
+           content.get('activities', content.get('rows', []))))
+    if not rows:
+        return 0
+
+    # Group by workstream
+    ws_map = {}
+    ws_order = []
+    for r in rows:
+        ws_name = r.get('type', r.get('workstream', r.get('area', r.get('name', 'General'))))
+        if ws_name not in ws_map:
+            ws_map[ws_name] = []
+            ws_order.append(ws_name)
+        ws_map[ws_name].append(r)
+
+    # Build gantt rows
+    gantt_rows = []
+    for ws_name in ws_order:
+        tactics = ws_map[ws_name]
+        for ti, tac in enumerate(tactics):
+            # Parse timing
+            months = tac.get('months', [])
+            if months:
+                start = _month_num(months[0])
+                end = _month_num(months[-1])
+            else:
+                tf = tac.get('timeframe', tac.get('timeline', ''))
+                if tf:
+                    start, end = _parse_timeframe(tf)
+                else:
+                    start = int(_parse_num(tac.get('start_month', tac.get('start', 1))) or 1)
+                    end = int(_parse_num(tac.get('end_month', tac.get('end', start + 2))) or (start + 2))
+            if start < 1: start = 1
+            if end < start: end = start + 1
+            if end > 12: end = 12
+
+            gantt_rows.append({
+                'ws': ws_name,
+                'tactic': tac.get('tactic', tac.get('name', '')),
+                'kpi': tac.get('kpi', tac.get('budget', '')),
+                'start': start,
+                'end': end,
+                'is_first': ti == 0,
+            })
+
+    if not gantt_rows:
+        return 0
+
+    # Layout constants (widescreen 13.33 x 7.5 inches)
+    label_left = 0.3
+    label_width = 2.0
+    chart_left = 2.5
+    chart_right = 12.8
+    chart_width = chart_right - chart_left
+    top_start = 1.4
+    month_w = chart_width / 12
+
+    n = len(gantt_rows)
+    bar_h = min(0.42, (5.5 / max(n, 1)))
+    gap = min(0.08, bar_h * 0.15)
+
+    shapes_added = 0
+
+    # Quarter shading backgrounds
+    q_colors = [
+        RGBColor(0xF5, 0xF3, 0xFF),  # Q1 light purple
+        RGBColor(0xEE, 0xF2, 0xFF),  # Q2 light indigo
+        RGBColor(0xDB, 0xEA, 0xFE),  # Q3 light blue
+        RGBColor(0xE0, 0xF2, 0xFE),  # Q4 light cyan
+    ]
+    for qi in range(4):
+        x = chart_left + qi * 3 * month_w
+        bg = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(x), Inches(top_start - 0.35),
+            Inches(3 * month_w), Inches(n * (bar_h + gap) + 0.7)
+        )
+        bg.fill.solid()
+        bg.fill.fore_color.rgb = q_colors[qi]
+        bg.line.fill.background()
+        # Q label
+        qtb = slide.shapes.add_textbox(
+            Inches(x), Inches(top_start - 0.35),
+            Inches(3 * month_w), Inches(0.25)
+        )
+        qp = qtb.text_frame.paragraphs[0]
+        qp.text = f'Q{qi+1}'
+        qp.font.size = Pt(9)
+        qp.font.bold = True
+        qp.font.color.rgb = SLATE
+        qp.alignment = PP_ALIGN.CENTER
+        shapes_added += 2
+
+    # Month labels
+    for mi in range(12):
+        mtb = slide.shapes.add_textbox(
+            Inches(chart_left + mi * month_w), Inches(top_start - 0.15),
+            Inches(month_w), Inches(0.15)
+        )
+        mp = mtb.text_frame.paragraphs[0]
+        mp.text = MONTH_NAMES[mi]
+        mp.font.size = Pt(6)
+        mp.font.color.rgb = SLATE
+        mp.alignment = PP_ALIGN.CENTER
+        shapes_added += 1
+
+    # Workstream color map
+    ws_colors = {}
+    for i, ws in enumerate(ws_order):
+        ws_colors[ws] = GANTT_COLORS[i % len(GANTT_COLORS)]
+
+    # Bars
+    for i, row in enumerate(gantt_rows):
+        y = top_start + i * (bar_h + gap)
+        color = ws_colors[row['ws']]
+        x_start = chart_left + (row['start'] - 1) * month_w
+        bar_w = (row['end'] - row['start'] + 1) * month_w
+
+        # Gantt bar
+        bar = slide.shapes.add_shape(
+            MSO_SHAPE.ROUNDED_RECTANGLE,
+            Inches(x_start), Inches(y),
+            Inches(max(bar_w, month_w * 0.5)), Inches(bar_h)
+        )
+        bar.fill.solid()
+        bar.fill.fore_color.rgb = color
+        bar.line.fill.background()
+
+        # Tactic name inside bar
+        tactic_text = row['tactic'][:30] if row['tactic'] else ''
+        if tactic_text and bar_w >= month_w * 1.5:
+            tf = bar.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            p.text = tactic_text
+            p.font.size = Pt(6.5)
+            p.font.bold = True
+            p.font.color.rgb = WHITE
+            p.alignment = PP_ALIGN.CENTER
+
+        # Workstream label (only for first tactic in group)
+        if row['is_first']:
+            wtb = slide.shapes.add_textbox(
+                Inches(label_left), Inches(y),
+                Inches(label_width), Inches(bar_h)
+            )
+            wtf = wtb.text_frame
+            wtf.word_wrap = True
+            wp = wtf.paragraphs[0]
+            wp.text = row['ws'][:22]
+            wp.font.size = Pt(7.5)
+            wp.font.bold = True
+            wp.font.color.rgb = color
+            wp.alignment = PP_ALIGN.RIGHT
+            shapes_added += 1
+
+        shapes_added += 1
+
+    logger.info(f"Gantt: {shapes_added} native shapes ({len(gantt_rows)} bars)")
+    return shapes_added
+
+
+# ═══════════════════════════════════════════════════════
 # DISPATCHER — Called from deck_renderer after slide copy
 # ═══════════════════════════════════════════════════════
 def add_chart_shapes(slide, layout, content):
@@ -483,6 +688,9 @@ def add_chart_shapes(slide, layout, content):
         'WATERFALL_PLOT': add_waterfall_shapes,
         'SWIMMER_PLOT': add_swimmer_shapes,
         'PIVOTAL_STUDIES': add_orr_bars,
+        'TACTICAL_PLAN_4': add_gantt_shapes,
+        'TACTICAL_PLAN_6': add_gantt_shapes,
+        'TACTICAL_PLAN_8': add_gantt_shapes,
     }
 
     renderer = dispatch.get(layout)
