@@ -134,17 +134,24 @@ HINT_TO_HEX = {
 # ---------------------------------------------------------------------------
 
 def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
-    """Find (xl, yt, xr, yb) by locating the long continuous axis lines.
+    """Find (xl, yt, xr, yb) of the data area of a KM plot.
 
-    Text next to the plot (rotated y-axis label, tick labels) is rejected
-    because letter strokes rarely span more than ~30 px. The left/bottom
-    axes of a KM figure typically run >=55% of the image's height/width.
+    Two-stage heuristic:
+      1. Find the long continuous axis lines (>=55 % of H/W). This rejects
+         short strokes belonging to text or ticks.
+      2. Refine the bounds by scanning for perpendicular tick marks that
+         are anchored on the detected axes. A *plot frame* is a box around
+         the data area but has no ticks on its inner side; the *real axis*
+         is the one with ticks. The outermost tick positions also give
+         exact (yt, yb) for y=1.0 / y=0.0 and (xl, xr) for x_min / x_max
+         — which previously failed on AQUILA where the frame line sat
+         above the real 100 % tick.
     """
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-    # Require >=55% of H/W as a single continuous segment => ignores text.
+    # Require >=55 % of H/W as a single continuous segment => ignores text.
     v_span = max(int(H * 0.55), 200)
     h_span = max(int(W * 0.55), 200)
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_span))
@@ -152,13 +159,8 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
     h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
 
-    # --- Left axis: prefer the vertical line whose top starts deepest
-    # into the image. A figure outer border spans top-to-bottom (top ~0),
-    # while a plot axis only spans the plot region (top ~20-30% of image).
-    # Among strong candidates, pick the one whose topmost pixel is LOWEST
-    # (= highest y), then the leftmost of those at similar depth. ---
-    left_cap = W // 2
     border_skip = max(int(W * 0.02), 4)
+    left_cap = W // 2
     col_density = v_lines.sum(axis=0)
     col_density[:border_skip] = 0
     col_density[left_cap:] = 0
@@ -175,15 +177,10 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
                 tops[int(c)] = int(rows[0])
         if tops:
             max_top = max(tops.values())
-            # Columns within 15 px of the deepest-starting candidate are
-            # the real plot axis cluster; take the leftmost of those.
             axis_cols = [c for c, t in tops.items() if t >= max_top - 15]
             xl = min(axis_cols)
             yt = tops[xl]
 
-    # --- Bottom axis: for the horizontal rows, prefer the one whose
-    # leftmost pixel is FURTHEST right (plot x-axis starts at xl, figure
-    # borders start at 0). ---
     bot_start = H // 2
     row_density = h_lines.sum(axis=1)
     row_density[:bot_start] = 0
@@ -200,12 +197,18 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
         if lefts:
             max_left = max(lefts.values())
             axis_rows = [r for r, lft in lefts.items() if lft >= max_left - 15]
-            yb = max(axis_rows)  # bottom-most of the cluster
+            yb = max(axis_rows)
 
-    # --- Right: right-most pixel on the bottom axis row. ---
     axis_row = h_lines[yb, :] if yb < H else np.array([])
     h_cols = np.where(axis_row > 0)[0]
     xr = int(h_cols[-1]) if len(h_cols) else int(W * 0.98)
+
+    # --- Tick-based refinement ---------------------------------------
+    # KM figures sometimes have a thin plot frame ABOVE the real y=1.0
+    # tick (NEJM's AQUILA). The detected axis line may be this frame.
+    # Looking at the y-axis tick marks (short horizontal strokes to the
+    # left of the y-axis spine) gives us the true yt and yb.
+    xl, yt, xr, yb = _refine_bounds_with_ticks(binary, xl, yt, xr, yb, H, W)
 
     # --- Sanity clamps ---
     xl = max(border_skip, min(xl, int(W * 0.35)))
@@ -215,6 +218,75 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
     if xr <= xl + 50 or yb <= yt + 50:
         return (int(W * 0.10), int(H * 0.05), int(W * 0.98), int(H * 0.88))
     return (xl, yt, xr, yb)
+
+
+def _refine_bounds_with_ticks(binary, xl, yt, xr, yb, H, W):
+    """Refine yt (and only yt) when a plot frame sits above the real y=1.0.
+
+    Conservative: we don't touch yb, xl, xr because the long-axis-line
+    heuristic is already reliable for those. The pathological case is
+    NEJM-style figures where there's a thin frame border a few tens of
+    pixels above the real 100 % y-tick — the previous implementation
+    picked this frame as yt, which pushed the whole y-axis calibration
+    off by ~20 %.
+
+    Method: look for short horizontal tick strokes immediately LEFT of
+    the y-axis spine. The topmost tick cluster gives the true y=1.0.
+    We only accept the refinement when:
+      * the tick is clearly BELOW the detected yt (>= 10 px)
+      * evenly-spaced ticks confirm this is a real tick ladder
+    """
+    # Look at a narrow band 4-8 px left of the y-axis — tick marks live
+    # here; tick *labels* start further left.
+    band_end = xl - 1
+    band_start = max(0, xl - 8)
+    if band_end - band_start < 3:
+        return xl, yt, xr, yb
+    region = binary[:yb, band_start:band_end]
+    if region.size == 0:
+        return xl, yt, xr, yb
+
+    row_hits = region.sum(axis=1)
+    # A tick row needs nearly the whole band filled (most of 4-8 px).
+    thresh = max(2, (band_end - band_start) - 1) * 255
+    rows_with_tick = np.where(row_hits >= thresh)[0]
+    ygrp = _group_close(rows_with_tick, gap=5)
+    if len(ygrp) < 4:
+        return xl, yt, xr, yb
+
+    # Check roughly-even tick spacing (signature of a real ladder).
+    spacings = np.diff(ygrp)
+    if len(spacings) < 3:
+        return xl, yt, xr, yb
+    median_sp = float(np.median(spacings))
+    if median_sp < 6:
+        return xl, yt, xr, yb
+    # At least 60 % of spacings within ±25 % of median.
+    ok = np.sum(np.abs(spacings - median_sp) <= median_sp * 0.25)
+    if ok / len(spacings) < 0.6:
+        return xl, yt, xr, yb
+
+    yt_tick = ygrp[0]
+    # Only refine yt if the tick ladder's top starts noticeably below
+    # the currently-detected yt — that's the frame-above-ticks case.
+    if yt_tick - yt >= 10 and yt_tick < yb - 100:
+        yt = yt_tick
+
+    return xl, yt, xr, yb
+
+
+def _group_close(arr, gap: int = 6) -> list[int]:
+    """Group consecutive integer positions whose spacing <= gap; return
+    the mean of each group as an int."""
+    if len(arr) == 0:
+        return []
+    groups = [[int(arr[0])]]
+    for v in arr[1:]:
+        if int(v) - groups[-1][-1] <= gap:
+            groups[-1].append(int(v))
+        else:
+            groups.append([int(v)])
+    return [int(round(sum(g) / len(g))) for g in groups]
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +316,9 @@ def extract_arm_curve(
     y_range: tuple,
     close_kernel: tuple = (5, 5),
     min_cc_width: int = 0,
+    min_cc_height: int = 0,
+    survival_band: Optional[tuple] = None,
+    tail_anchors: Optional[list] = None,
 ) -> tuple[list, list]:
     """Return (coords [(t, s_pct)], censored_times [t]) for one arm."""
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -273,7 +348,7 @@ def extract_arm_curve(
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, close_kernel)
     plot_mask = cv2.morphologyEx(plot_mask, cv2.MORPH_CLOSE, k_close)
 
-    # Drop speckle / narrow components
+    # Drop speckle / narrow / short components
     num, lab, stats, _ = cv2.connectedComponentsWithStats(plot_mask)
     clean = np.zeros_like(plot_mask)
     for i in range(1, num):
@@ -282,8 +357,25 @@ def extract_arm_curve(
             continue
         if min_cc_width and w < min_cc_width:
             continue
+        if min_cc_height and h < min_cc_height:
+            continue
         clean[lab == i] = 255
     plot_mask = clean
+
+    # Optional survival-band filter: zero-out rows outside [s_min, s_max] (%).
+    # Useful for OS curves that stay near the top — rejects HR/annotation
+    # text and axis labels in the lower portion of the plot.
+    if survival_band is not None:
+        s_min, s_max = survival_band
+        y_scale_band = 100.0 if y_range[1] <= 1.001 else 1.0
+        ph_px = yb - yt
+        y_top = yt + int((1 - s_max / (y_range[1] * y_scale_band)) * ph_px)
+        y_bot = yt + int((1 - s_min / (y_range[1] * y_scale_band)) * ph_px)
+        y_top = max(y_top, yt)
+        y_bot = min(y_bot, yb)
+        band_mask = np.zeros_like(plot_mask)
+        band_mask[y_top:y_bot, :] = 255
+        plot_mask = cv2.bitwise_and(plot_mask, band_mask)
 
     y_scale = 100.0 if y_range[1] <= 1.001 else 1.0
     coords: list[tuple] = []
@@ -310,48 +402,132 @@ def extract_arm_curve(
     else:
         coords = [(0.0, y_max_pct)]
 
+    # Smooth spike artifacts: split unnaturally large drops (mask loss)
+    # into smaller intermediate steps.
+    coords = smooth_spikes(coords, factor=3.0)
+
+    # Optional tail anchors to complete a plateau or final drop that
+    # pixel extraction missed (e.g. Ven plateau, Plac -> 0%).
+    if tail_anchors:
+        last_t, last_s = coords[-1]
+        for t, s in tail_anchors:
+            if t > last_t:
+                if s > last_s:
+                    s = last_s
+                coords.append((float(t), float(s)))
+                last_t, last_s = t, s
+
     # Censoring detection runs on the *raw* (pre-close) mask
     censored = _detect_censoring(raw_mask, plot_bounds, x_range, y_range)
 
     return coords, censored
 
 
-def _detect_censoring(mask, plot_bounds, x_range, y_range) -> list[float]:
-    """Isolate small vertical tick marks on a KM curve.
+def smooth_spikes(coords: list, factor: float = 3.0,
+                  min_threshold_pct: float = 2.0) -> list:
+    """Split oversized drops into micro-steps to smooth mask-loss artifacts.
 
-    Ticks are short thin vertical strokes (~3-14 px tall, 1-3 px wide).
-    We keep vertical-only features via morphological opening, then
-    subtract wide horizontal features (curve plateaus). The residual
-    contains censoring ticks plus some step-drop fragments; size
-    filtering keeps only the small tick-shaped components.
+    A drop s[i-1] -> s[i] greater than ``factor`` * median(drops) and at
+    least ``min_threshold_pct`` % is spread linearly across the t-interval
+    as several intermediate points. Real KM step drops are left alone
+    because they are near the median drop size.
+    """
+    if len(coords) < 3:
+        return coords
+    drops = [coords[i-1][1] - coords[i][1]
+             for i in range(1, len(coords))
+             if coords[i-1][1] > coords[i][1]]
+    if not drops:
+        return coords
+    drops_sorted = sorted(drops)
+    median_drop = drops_sorted[len(drops_sorted) // 2]
+    if median_drop <= 0:
+        median_drop = 0.3
+    threshold = max(median_drop * factor, min_threshold_pct)
+
+    out = [coords[0]]
+    for i in range(1, len(coords)):
+        t_prev, s_prev = out[-1]
+        t_curr, s_curr = coords[i]
+        drop = s_prev - s_curr
+        if drop > threshold:
+            dt_total = max(t_curr - t_prev, 0.0)
+            if dt_total < 0.1:
+                dt_total = min(1.2, max(0.3, drop / 25.0))
+            n_steps = min(60, max(2, int(round(drop / median_drop))))
+            for k in range(1, n_steps):
+                frac = k / n_steps
+                t_k = t_prev + frac * dt_total
+                s_k = s_prev - frac * drop
+                out.append((round(float(t_k), 4), round(float(s_k), 3)))
+        out.append((float(t_curr), float(s_curr)))
+    return out
+
+
+def _detect_censoring(mask, plot_bounds, x_range, y_range) -> list[float]:
+    """Find censoring tick marks via local-baseline-deviation on the raw mask.
+
+    For each column we record the topmost mask pixel (curve top). A
+    censoring tick is a column where the mask spikes upward by >=2 px
+    above the local median baseline. This approach is agnostic to whether
+    the tick's mask is continuous with the curve body — which matters for
+    KM plots where ticks are drawn in the same color as the line.
     """
     xl, yt, xr, yb = plot_bounds
     xmin, xmax = x_range
+    pw = xr - xl
 
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 4))
-    vertical = cv2.morphologyEx(mask, cv2.MORPH_OPEN, v_kernel)
+    # topmost y-pixel per column
+    top_y = np.full(pw, -1, dtype=np.int32)
+    for x_off in range(pw):
+        col = mask[yt:yb, xl + x_off]
+        active = np.where(col > 0)[0]
+        if len(active):
+            top_y[x_off] = int(active[0])
 
-    # Use a wider horizontal kernel so true plateau runs (dozens of px)
-    # are removed, but short 4-6 px step-drop shelves stay. We do NOT
-    # dilate — dilation was nibbling tick tops/bottoms on their plateau
-    # side and collapsing them below the minimum-height filter.
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
-    horizontal = cv2.morphologyEx(mask, cv2.MORPH_OPEN, h_kernel)
+    # Local median baseline (small rolling window so real curve drops
+    # are preserved in the baseline).
+    win = max(11, pw // 60)
+    if win % 2 == 0:
+        win += 1
+    half = win // 2
+    baseline = np.full(pw, -1, dtype=np.int32)
+    for i in range(pw):
+        lo, hi = max(0, i - half), min(pw, i + half + 1)
+        seg = top_y[lo:hi]
+        seg = seg[seg >= 0]
+        if len(seg) >= 3:
+            baseline[i] = int(np.median(seg))
 
-    ticks_only = cv2.subtract(vertical, horizontal)
+    tick_cols = np.where(
+        (top_y >= 0) & (baseline >= 0) & (baseline - top_y >= 2)
+    )[0]
 
-    num, _, stats, cent = cv2.connectedComponentsWithStats(ticks_only)
     times: list[float] = []
-    for i in range(1, num):
-        x, y, w, h, area = stats[i]
-        if not (xl <= x <= xr and yt <= y <= yb):
-            continue
-        if 2 <= h <= 20 and 1 <= w <= 6 and 2 <= area <= 80:
-            cx = cent[i][0]
-            t, _ = _px_to_data(cx, cent[i][1], plot_bounds, x_range, y_range)
+    if len(tick_cols):
+        groups = [[tick_cols[0]]]
+        for c in tick_cols[1:]:
+            if c - groups[-1][-1] <= 2:
+                groups[-1].append(c)
+            else:
+                groups.append([c])
+        for g in groups:
+            if len(g) > 6:  # too wide — probably a real curve drop
+                continue
+            cx = xl + int(np.mean(g))
+            t, _ = _px_to_data(cx, yt, plot_bounds, x_range, y_range)
             if xmin <= t <= xmax:
                 times.append(round(float(t), 2))
-    return sorted(set(times))
+
+    # Dedup near-coincident ticks (< 0.15 x-units apart).
+    times.sort()
+    dedup: list[float] = []
+    last = -1e9
+    for t in times:
+        if t - last > 0.15:
+            dedup.append(t)
+            last = t
+    return dedup
 
 
 # ---------------------------------------------------------------------------
@@ -400,13 +576,16 @@ def render_reconstruction_png(
             color=arm.get("color_hex", "#2166AC"), linewidth=2.0,
             label=f'{arm["name"]} (n={arm.get("n", "?")})' if arm.get("n") else arm["name"],
         )
-        for tc in arm.get("censored_times", []):
-            s = _survival_at(arm["coordinates"], tc)
-            if s is not None:
-                ax.plot(
-                    [tc, tc], [s - 1.3, s + 1.3],
-                    color=arm.get("color_hex", "#2166AC"), linewidth=1,
-                )
+        cens_t = arm.get("censored_times") or []
+        cens_s = [_survival_at(arm["coordinates"], tc) for tc in cens_t]
+        cens_t = [t for t, s in zip(cens_t, cens_s) if s is not None]
+        cens_s = [s for s in cens_s if s is not None]
+        if cens_t:
+            ax.plot(
+                cens_t, cens_s, linestyle="None", marker="|",
+                color=arm.get("color_hex", "#2166AC"),
+                markersize=6, markeredgewidth=1.2,
+            )
 
     ax.axhline(50, color="gray", linestyle=":", linewidth=0.8)
     ax.set_xlim(x_range[0], x_range[1])
