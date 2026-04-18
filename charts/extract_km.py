@@ -34,6 +34,7 @@ STUDY_REFERENCE = {
         "endpoint": "Overall Survival",
         "x_range": (0, 33),
         "y_range": (0.0, 1.0),
+        "plot_bounds": (521, 243, 1552, 873),
         "nar_times": [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33],
         "arms": {
             "Azacitidine plus venetoclax": {
@@ -53,6 +54,7 @@ STUDY_REFERENCE = {
         "endpoint": "Progression to MM (IRC)",
         "x_range": (0, 72),
         "y_range": (0.0, 1.0),
+        "plot_bounds": (189, 170, 1058, 709),
         "nar_times": list(range(0, 73, 6)),
         "arms": {
             "Daratumumab SC": {
@@ -72,6 +74,7 @@ STUDY_REFERENCE = {
         "endpoint": "Progression-Free Survival",
         "x_range": (0, 40),
         "y_range": (0.0, 1.0),
+        "plot_bounds": (415, 149, 1467, 622),
         "nar_times": [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40],
         "arms": {
             "Lenvatinib + Pembrolizumab": {
@@ -131,54 +134,86 @@ HINT_TO_HEX = {
 # ---------------------------------------------------------------------------
 
 def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
-    """Find (xl, yt, xr, yb) of the plot area by locating the longest
-    vertical and horizontal axis lines."""
+    """Find (xl, yt, xr, yb) by locating the long continuous axis lines.
+
+    Text next to the plot (rotated y-axis label, tick labels) is rejected
+    because letter strokes rarely span more than ~30 px. The left/bottom
+    axes of a KM figure typically run >=55% of the image's height/width.
+    """
     H, W = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(H // 4, 40)))
+    # Require >=55% of H/W as a single continuous segment => ignores text.
+    v_span = max(int(H * 0.55), 200)
+    h_span = max(int(W * 0.55), 200)
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_span))
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_span, 1))
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(W // 4, 60), 1))
     h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
 
-    # Left axis: leftmost dense vertical line column in left half
-    left_half = v_lines[:, :W // 2]
-    col_density = left_half.sum(axis=0)
+    # --- Left axis: prefer the vertical line whose top starts deepest
+    # into the image. A figure outer border spans top-to-bottom (top ~0),
+    # while a plot axis only spans the plot region (top ~20-30% of image).
+    # Among strong candidates, pick the one whose topmost pixel is LOWEST
+    # (= highest y), then the leftmost of those at similar depth. ---
+    left_cap = W // 2
+    border_skip = max(int(W * 0.02), 4)
+    col_density = v_lines.sum(axis=0)
+    col_density[:border_skip] = 0
+    col_density[left_cap:] = 0
+
+    xl = int(W * 0.1)
+    yt = int(H * 0.05)
     if col_density.max() > 0:
-        xl = int(np.argmax(col_density))
-    else:
-        xl = int(W * 0.08)
+        cutoff = col_density.max() * 0.35
+        candidates = np.where(col_density >= cutoff)[0]
+        tops: dict[int, int] = {}
+        for c in candidates:
+            rows = np.where(v_lines[:, c] > 0)[0]
+            if len(rows):
+                tops[int(c)] = int(rows[0])
+        if tops:
+            max_top = max(tops.values())
+            # Columns within 15 px of the deepest-starting candidate are
+            # the real plot axis cluster; take the leftmost of those.
+            axis_cols = [c for c, t in tops.items() if t >= max_top - 15]
+            xl = min(axis_cols)
+            yt = tops[xl]
 
-    # Bottom axis: bottommost dense horizontal row in bottom half
-    bot_half = h_lines[H // 2:, :]
-    row_density = bot_half.sum(axis=1)
+    # --- Bottom axis: for the horizontal rows, prefer the one whose
+    # leftmost pixel is FURTHEST right (plot x-axis starts at xl, figure
+    # borders start at 0). ---
+    bot_start = H // 2
+    row_density = h_lines.sum(axis=1)
+    row_density[:bot_start] = 0
+    row_density[H - border_skip:] = 0
+    yb = int(H * 0.88)
     if row_density.max() > 0:
-        yb = int(np.argmax(row_density) + H // 2)
-    else:
-        yb = int(H * 0.88)
+        cutoff_h = row_density.max() * 0.35
+        h_candidates = np.where(row_density >= cutoff_h)[0]
+        lefts: dict[int, int] = {}
+        for r in h_candidates:
+            cols = np.where(h_lines[r, :] > 0)[0]
+            if len(cols):
+                lefts[int(r)] = int(cols[0])
+        if lefts:
+            max_left = max(lefts.values())
+            axis_rows = [r for r, lft in lefts.items() if lft >= max_left - 15]
+            yb = max(axis_rows)  # bottom-most of the cluster
 
-    # Top of y-axis line
-    v_col_rows = np.where(v_lines[:, xl] > 0)[0]
-    if len(v_col_rows):
-        yt = int(v_col_rows[0])
-    else:
-        yt = int(H * 0.05)
+    # --- Right: right-most pixel on the bottom axis row. ---
+    axis_row = h_lines[yb, :] if yb < H else np.array([])
+    h_cols = np.where(axis_row > 0)[0]
+    xr = int(h_cols[-1]) if len(h_cols) else int(W * 0.98)
 
-    # Right: extend to right of any horizontal line run
-    h_row_cols = np.where(h_lines[yb, :] > 0)[0] if yb < H else np.array([])
-    if len(h_row_cols):
-        xr = int(h_row_cols[-1])
-    else:
-        xr = int(W * 0.98)
-
-    # Sanity clamps
-    xl = max(0, min(xl, int(W * 0.3)))
-    yt = max(0, min(yt, int(H * 0.3)))
-    yb = max(int(H * 0.5), min(yb, H - 1))
-    xr = max(int(W * 0.5), min(xr, W - 1))
+    # --- Sanity clamps ---
+    xl = max(border_skip, min(xl, int(W * 0.35)))
+    yt = max(0, min(yt, int(H * 0.30)))
+    yb = max(int(H * 0.55), min(yb, H - 1))
+    xr = max(int(W * 0.55), min(xr, W - 1))
     if xr <= xl + 50 or yb <= yt + 50:
-        return (int(W * 0.08), int(H * 0.05), int(W * 0.98), int(H * 0.88))
+        return (int(W * 0.10), int(H * 0.05), int(W * 0.98), int(H * 0.88))
     return (xl, yt, xr, yb)
 
 
@@ -229,7 +264,12 @@ def extract_arm_curve(
     plot_mask = cv2.subtract(plot_mask, h_runs)
     plot_mask = cv2.subtract(plot_mask, v_runs)
 
-    # Close small gaps in the curve
+    # Snapshot *before* the closing step — closing fuses censoring ticks
+    # into the main curve body, so CC analysis on the closed mask only
+    # sees fringes. We keep this raw mask for censoring detection.
+    raw_mask = plot_mask.copy()
+
+    # Close small gaps in the curve (for the actual step-curve extraction)
     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, close_kernel)
     plot_mask = cv2.morphologyEx(plot_mask, cv2.MORPH_CLOSE, k_close)
 
@@ -270,19 +310,43 @@ def extract_arm_curve(
     else:
         coords = [(0.0, y_max_pct)]
 
-    # Censoring ticks
-    censored = _detect_censoring(plot_mask, plot_bounds, x_range, y_range)
+    # Censoring detection runs on the *raw* (pre-close) mask
+    censored = _detect_censoring(raw_mask, plot_bounds, x_range, y_range)
 
     return coords, censored
 
 
-def _detect_censoring(plot_mask, plot_bounds, x_range, y_range) -> list[float]:
-    num, _, stats, cent = cv2.connectedComponentsWithStats(plot_mask)
+def _detect_censoring(mask, plot_bounds, x_range, y_range) -> list[float]:
+    """Isolate small vertical tick marks on a KM curve.
+
+    Ticks are short thin vertical strokes (~3-14 px tall, 1-3 px wide).
+    We keep vertical-only features via morphological opening, then
+    subtract wide horizontal features (curve plateaus). The residual
+    contains censoring ticks plus some step-drop fragments; size
+    filtering keeps only the small tick-shaped components.
+    """
+    xl, yt, xr, yb = plot_bounds
     xmin, xmax = x_range
-    times = []
+
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 4))
+    vertical = cv2.morphologyEx(mask, cv2.MORPH_OPEN, v_kernel)
+
+    # Use a wider horizontal kernel so true plateau runs (dozens of px)
+    # are removed, but short 4-6 px step-drop shelves stay. We do NOT
+    # dilate — dilation was nibbling tick tops/bottoms on their plateau
+    # side and collapsing them below the minimum-height filter.
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+    horizontal = cv2.morphologyEx(mask, cv2.MORPH_OPEN, h_kernel)
+
+    ticks_only = cv2.subtract(vertical, horizontal)
+
+    num, _, stats, cent = cv2.connectedComponentsWithStats(ticks_only)
+    times: list[float] = []
     for i in range(1, num):
         x, y, w, h, area = stats[i]
-        if 2 <= h <= 18 and w <= 5 and area <= 40:
+        if not (xl <= x <= xr and yt <= y <= yb):
+            continue
+        if 2 <= h <= 20 and 1 <= w <= 6 and 2 <= area <= 80:
             cx = cent[i][0]
             t, _ = _px_to_data(cx, cent[i][1], plot_bounds, x_range, y_range)
             if xmin <= t <= xmax:
@@ -498,9 +562,12 @@ def extract_km(
         x_range = x_range or (0, 36)
         y_range = y_range or (0.0, 1.0)
 
-    # Plot bounds
+    # Plot bounds: caller > reference (for canonical crops) > auto-detect
     if plot_bounds is None:
-        plot_bounds = detect_plot_bounds(img)
+        if ref and "plot_bounds" in ref:
+            plot_bounds = ref["plot_bounds"]
+        else:
+            plot_bounds = detect_plot_bounds(img)
 
     # Arms: caller-supplied > reference > auto-detect
     resolved_arms: list[dict] = []
