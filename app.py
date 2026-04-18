@@ -21,6 +21,7 @@ import logging
 import numpy as np
 
 from charts.kaplan_meier import render_kaplan_meier
+from charts.extract_km import extract_km
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,74 @@ def health():
 def kaplan_meier(req: KMRequest):
     buf = render_kaplan_meier(req)
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ══════════════════════════════════════════════════════════════════
+# KM CURVE EXTRACTION — OpenCV pixel-level reader
+# ══════════════════════════════════════════════════════════════════
+
+class ArmColorHint(BaseModel):
+    name: str = Field(..., description="Arm name")
+    color_hint: Optional[str] = Field(
+        None,
+        description="Color hint: blue | green | red | orange | yellow | "
+                    "purple | black | gray (or German: dunkelblau, "
+                    "waldgruen, grau)",
+    )
+
+
+class ExtractKMRequest(BaseModel):
+    image_base64: str = Field(..., description="PNG or JPG as base64")
+    study_name: Optional[str] = Field(
+        None,
+        description="Optional study name (e.g. 'VIALE-A', 'AQUILA', 'CLEAR') "
+                    "for metadata lookup",
+    )
+    arm_colors: Optional[list[ArmColorHint]] = Field(
+        None,
+        description="Optional arm color hints. If omitted and study_name "
+                    "is unknown, arms are auto-detected.",
+    )
+    x_range: Optional[list[float]] = Field(
+        None, description="Optional axis range override [min, max]"
+    )
+    y_range: Optional[list[float]] = Field(
+        None, description="Optional Y-axis range override [min, max]"
+    )
+    plot_bounds: Optional[list[int]] = Field(
+        None,
+        description="Optional plot pixel bounds override [xl, yt, xr, yb]",
+    )
+
+
+@app.post("/extract-km")
+def extract_km_endpoint(req: ExtractKMRequest):
+    """
+    POST /extract-km — Extract Kaplan-Meier curves from a publication figure.
+
+    Input:  image (base64), optional study_name, optional arm_colors.
+    Output: arm coordinates [[time, survival%], ...], censored times, median,
+            a reconstructed medaccur-style PNG, confidence tier 1-3.
+    """
+    try:
+        arm_colors = (
+            [a.model_dump() for a in req.arm_colors] if req.arm_colors else None
+        )
+        result = extract_km(
+            image_base64=req.image_base64,
+            study_name=req.study_name,
+            arm_colors=arm_colors,
+            x_range=tuple(req.x_range) if req.x_range else None,
+            y_range=tuple(req.y_range) if req.y_range else None,
+            plot_bounds=tuple(req.plot_bounds) if req.plot_bounds else None,
+        )
+        return JSONResponse(result)
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"extract-km error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ══════════════════════════════════════════════════════════════════
