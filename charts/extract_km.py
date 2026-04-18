@@ -224,10 +224,14 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
     if picked_ticks:
         xl = picked_ticks[0]
         xr = picked_ticks[-1]
-        # And re-pick yt: if the currently-detected xl-column vertical
-        # line extends far past yb (outer frame), yt is probably also
-        # wrong — use the topmost tick on the y-axis instead.
-        # (yt refinement happens below via _refine_bounds_with_ticks.)
+        # And re-pick yt from y-axis ticks: the long-vertical-line
+        # pass may have locked onto an outer page frame that extends
+        # far past the real plot top, placing yt at the page margin
+        # instead of the y=1.0 tick. The topmost leftward tick on the
+        # y-axis spine at xl is the true y=1.0 position.
+        y_ticks = _leftward_tick_rows(binary, xl, yb, H)
+        if y_ticks:
+            yt = y_ticks[0]
     else:
         axis_row = h_lines[yb, :] if yb < H else np.array([])
         h_cols = np.where(axis_row > 0)[0]
@@ -363,7 +367,102 @@ def _downward_tick_cols(binary, y_row, W, H) -> list[int]:
     ok = int(np.sum(np.abs(spacings - median_sp) <= median_sp * 0.25))
     if ok / len(spacings) < 0.6:
         return []
+
+    # Trim leading / trailing ticks whose spacing to the next tick is
+    # off-ladder (< 70 % of median). These come from:
+    #   - y-axis spine (short downward overhang just past yb)
+    #   - a stray glyph from the x-axis tick *label* row if it sits
+    #     close enough to the band
+    # Without trimming, xl gets anchored to the y-axis spine rather
+    # than the "0 months" tick — off by one tick spacing, which
+    # biases the time calibration and undershoots medians by ~1 mo.
+    def _trim_edges(ticks: list[int], med: float) -> list[int]:
+        lo_bound = med * 0.70
+        hi_bound = med * 1.30
+        out = list(ticks)
+        while len(out) >= 3:
+            sp = out[1] - out[0]
+            if sp < lo_bound or sp > hi_bound:
+                out.pop(0)
+            else:
+                break
+        while len(out) >= 3:
+            sp = out[-1] - out[-2]
+            if sp < lo_bound or sp > hi_bound:
+                out.pop()
+            else:
+                break
+        return out
+
+    xgrp = _trim_edges(xgrp, median_sp)
+    if len(xgrp) < 4:
+        return []
     return xgrp
+
+
+def _leftward_tick_rows(binary, x_col, yb, H) -> list[int]:
+    """Return y-row positions of leftward tick marks on the y-axis
+    spine at column x_col, or [] if no regular tick ladder is found.
+
+    Used to derive yt (topmost tick = y=1.0) when the long-vertical-
+    line detection is fooled by an outer page frame that extends past
+    the real y-axis.
+    """
+    band_end = x_col - 1
+    band_start = max(0, x_col - 10)
+    if band_end - band_start < 3:
+        return []
+    region = binary[:yb, band_start:band_end]
+    if region.size == 0:
+        return []
+    row_hits = region.sum(axis=1)
+    thresh = max(2, (band_end - band_start) - 1) * 255
+    rows_with_tick = np.where(row_hits >= thresh)[0]
+
+    real_ticks: list[int] = []
+    max_tick_len = 25
+    x_check = x_col - 5
+    if x_check < 0:
+        return []
+    for r in rows_with_tick:
+        x = x_check
+        run_left = 0
+        while x >= 0 and binary[r, x] > 0 and run_left < 200:
+            run_left += 1
+            x -= 1
+        if run_left <= max_tick_len:
+            real_ticks.append(int(r))
+
+    ygrp = _group_close(real_ticks, gap=5)
+    if len(ygrp) < 4:
+        return []
+    spacings = np.diff(ygrp)
+    if len(spacings) < 3:
+        return []
+    median_sp = float(np.median(spacings))
+    if median_sp < 6:
+        return []
+    ok = int(np.sum(np.abs(spacings - median_sp) <= median_sp * 0.25))
+    if ok / len(spacings) < 0.6:
+        return []
+
+    # Trim edge ticks with off-ladder spacing (same rationale as
+    # _downward_tick_cols).
+    lo, hi = median_sp * 0.70, median_sp * 1.30
+    out = list(ygrp)
+    while len(out) >= 3:
+        sp = out[1] - out[0]
+        if sp < lo or sp > hi:
+            out.pop(0)
+        else:
+            break
+    while len(out) >= 3:
+        sp = out[-1] - out[-2]
+        if sp < lo or sp > hi:
+            out.pop()
+        else:
+            break
+    return out if len(out) >= 4 else []
 
 
 def _group_close(arr, gap: int = 6) -> list[int]:
