@@ -22,6 +22,7 @@ import numpy as np
 
 from charts.kaplan_meier import render_kaplan_meier
 from charts.extract_km import extract_km
+from charts.extract_km_from_pdf import extract_km_from_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,46 @@ class ExtractKMRequest(BaseModel):
         None,
         description="Optional plot pixel bounds override [xl, yt, xr, yb]",
     )
+
+
+class ExtractKMFromPDFRequest(BaseModel):
+    pdf_base64: str = Field(..., description="Full PDF document as base64")
+    study_name: Optional[str] = Field(
+        None, description="Optional study name for reference lookup"
+    )
+    min_score: int = Field(
+        4,
+        description="Minimum keyword score required to accept a page as "
+                    "a KM figure page",
+    )
+
+
+@app.post("/extract-km-from-pdf")
+def extract_km_from_pdf_endpoint(req: ExtractKMFromPDFRequest):
+    """
+    POST /extract-km-from-pdf — Extract KM curves from a full PDF.
+
+    Scans every page for KM-figure keywords ("no. at risk", "hazard
+    ratio", "overall survival", ...), picks the best-scoring page,
+    auto-crops the figure, renders at 400 DPI, and runs the existing
+    extract_km pipeline on the crop.
+
+    Response: same shape as /extract-km plus page_number,
+    figure_crop_base64, and pdf_keyword_score.
+    """
+    try:
+        result = extract_km_from_pdf(
+            pdf_base64=req.pdf_base64,
+            study_name=req.study_name,
+            min_score=req.min_score,
+        )
+        return JSONResponse(result)
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"extract-km-from-pdf error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/extract-km")

@@ -167,41 +167,71 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
 
     xl = int(W * 0.1)
     yt = int(H * 0.05)
+    col_tops: dict[int, int] = {}
+    col_bottoms: dict[int, int] = {}
     if col_density.max() > 0:
         cutoff = col_density.max() * 0.35
         candidates = np.where(col_density >= cutoff)[0]
-        tops: dict[int, int] = {}
         for c in candidates:
             rows = np.where(v_lines[:, c] > 0)[0]
             if len(rows):
-                tops[int(c)] = int(rows[0])
-        if tops:
-            max_top = max(tops.values())
-            axis_cols = [c for c, t in tops.items() if t >= max_top - 15]
+                col_tops[int(c)] = int(rows[0])
+                col_bottoms[int(c)] = int(rows[-1])
+        if col_tops:
+            max_top = max(col_tops.values())
+            axis_cols = [c for c, t in col_tops.items() if t >= max_top - 15]
             xl = min(axis_cols)
-            yt = tops[xl]
+            yt = col_tops[xl]
 
-    bot_start = H // 2
     row_density = h_lines.sum(axis=1)
-    row_density[:bot_start] = 0
     row_density[H - border_skip:] = 0
     yb = int(H * 0.88)
+    picked_ticks: list[int] = []
     if row_density.max() > 0:
         cutoff_h = row_density.max() * 0.35
-        h_candidates = np.where(row_density >= cutoff_h)[0]
-        lefts: dict[int, int] = {}
+        h_candidates = sorted(np.where(row_density >= cutoff_h)[0].tolist())
+        # Group near-adjacent rows into single "lines"
+        line_groups: list[list[int]] = []
         for r in h_candidates:
-            cols = np.where(h_lines[r, :] > 0)[0]
-            if len(cols):
-                lefts[int(r)] = int(cols[0])
-        if lefts:
-            max_left = max(lefts.values())
-            axis_rows = [r for r, lft in lefts.items() if lft >= max_left - 15]
-            yb = max(axis_rows)
+            if line_groups and r - line_groups[-1][-1] <= 15:
+                line_groups[-1].append(r)
+            else:
+                line_groups.append([r])
+        # Each line's representative row = bottommost of its rows
+        line_rows = [max(g) for g in line_groups]
+        # Only lines strictly below yt (plot top) can be yb
+        line_rows = [r for r in line_rows if r > yt + 80]
+        # Prefer the topmost line with downward tick marks (x-axis signature);
+        # NaR table / caption-box borders don't have ticks below them.
+        picked = None
+        picked_ticks: list[int] = []
+        for cand in line_rows:
+            ticks = _downward_tick_cols(binary, cand, W, H)
+            if ticks:
+                picked = cand
+                picked_ticks = ticks
+                break
+        if picked is None and line_rows:
+            # Fallback: topmost long horizontal line below yt
+            picked = line_rows[0]
+        if picked is not None:
+            yb = picked
 
-    axis_row = h_lines[yb, :] if yb < H else np.array([])
-    h_cols = np.where(axis_row > 0)[0]
-    xr = int(h_cols[-1]) if len(h_cols) else int(W * 0.98)
+    # If we have downward ticks, derive xl and xr from their leftmost/
+    # rightmost positions. This is more reliable than long-line detection
+    # because the outer page frame or caption box can fool the vertical
+    # line pass (too long to be the actual y-axis spine).
+    if picked_ticks:
+        xl = picked_ticks[0]
+        xr = picked_ticks[-1]
+        # And re-pick yt: if the currently-detected xl-column vertical
+        # line extends far past yb (outer frame), yt is probably also
+        # wrong — use the topmost tick on the y-axis instead.
+        # (yt refinement happens below via _refine_bounds_with_ticks.)
+    else:
+        axis_row = h_lines[yb, :] if yb < H else np.array([])
+        h_cols = np.where(axis_row > 0)[0]
+        xr = int(h_cols[-1]) if len(h_cols) else int(W * 0.98)
 
     # --- Tick-based refinement ---------------------------------------
     # KM figures sometimes have a thin plot frame ABOVE the real y=1.0
@@ -213,7 +243,10 @@ def detect_plot_bounds(img_bgr: np.ndarray) -> tuple[int, int, int, int]:
     # --- Sanity clamps ---
     xl = max(border_skip, min(xl, int(W * 0.35)))
     yt = max(0, min(yt, int(H * 0.30)))
-    yb = max(int(H * 0.55), min(yb, H - 1))
+    # yb can be in the UPPER half of the crop for PDF figures that
+    # include NaR tables and captions below the plot, so only clamp
+    # relative to yt, not to H.
+    yb = max(yt + 100, min(yb, H - 1))
     xr = max(int(W * 0.55), min(xr, W - 1))
     if xr <= xl + 50 or yb <= yt + 50:
         return (int(W * 0.10), int(H * 0.05), int(W * 0.98), int(H * 0.88))
@@ -273,6 +306,64 @@ def _refine_bounds_with_ticks(binary, xl, yt, xr, yb, H, W):
         yt = yt_tick
 
     return xl, yt, xr, yb
+
+
+def _downward_tick_cols(binary, y_row, W, H) -> list[int]:
+    """Return the x-column positions of downward tick marks just below
+    y_row, or [] if the row does not have a regular tick ladder.
+
+    Used both to CHOOSE yb (only the plot x-axis has downward ticks;
+    NaR / caption rules don't) and to DERIVE xl/xr (leftmost and
+    rightmost tick = plot x-range endpoints, bypassing unreliable
+    long-line detection which can be fooled by an outer page frame).
+
+    Also filters out page-margin / outer-frame columns: those extend
+    the full image height, while real tick marks are short (≤25 px).
+    """
+    band_start = y_row + 2
+    band_end = min(H, y_row + 10)
+    if band_end - band_start < 3:
+        return []
+    col_start = 0
+    col_end = min(W, int(W * 0.99))
+    region = binary[band_start:band_end, col_start:col_end]
+    if region.size == 0:
+        return []
+    col_hits = region.sum(axis=0)
+    thresh = max(2, (band_end - band_start) - 1) * 255
+    cols_with_tick = np.where(col_hits >= thresh)[0]
+
+    # Drop columns that belong to a tall vertical line (page margin /
+    # outer frame). A real tick stroke is ≤25 px tall and ends near the
+    # axis; a page margin keeps going for hundreds of pixels.
+    real_ticks: list[int] = []
+    max_tick_len = 25
+    y_check = y_row + 5
+    if y_check >= H:
+        return []
+    for c in cols_with_tick:
+        # Count how far the black run extends BELOW y_check.
+        y = y_check
+        run_down = 0
+        while y < H and binary[y, c] > 0 and run_down < 200:
+            run_down += 1
+            y += 1
+        if run_down <= max_tick_len:
+            real_ticks.append(int(c))
+
+    xgrp = _group_close(real_ticks, gap=5)
+    if len(xgrp) < 4:
+        return []
+    spacings = np.diff(xgrp)
+    if len(spacings) < 3:
+        return []
+    median_sp = float(np.median(spacings))
+    if median_sp < 6:
+        return []
+    ok = int(np.sum(np.abs(spacings - median_sp) <= median_sp * 0.25))
+    if ok / len(spacings) < 0.6:
+        return []
+    return xgrp
 
 
 def _group_close(arr, gap: int = 6) -> list[int]:
