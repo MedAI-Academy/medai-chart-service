@@ -24,6 +24,7 @@ from charts.kaplan_meier import render_kaplan_meier
 from charts.extract_km import extract_km
 from charts.extract_km_from_pdf import extract_km_from_pdf
 from charts.extract_forest_from_pdf import extract_forest_from_pdf
+from charts.forest_plot_nejm import render_forest_nejm
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,51 @@ class ExtractForestFromPDFRequest(BaseModel):
     )
 
 
+# ── Phase 4A: reconstruction-based forest plot ────────────────────
+# Unlike /extract-forest-from-pdf (which crops the original figure),
+# /charts/forest-plot takes STRUCTURED subgroup data and renders a
+# NEJM-style forest plot in the platform's own style. Liability
+# model matches KM curves: own visualisation, "Reconstructed from [ref]"
+# footer, confidence tier 2. No copyright exposure.
+
+class ForestSubgroup(BaseModel):
+    # Header row (group separator)
+    is_header: Optional[bool] = Field(None, description="True if this is a group-heading row")
+    category: Optional[str] = Field(None, description="Group label when is_header=True")
+    # Data row
+    name: Optional[str] = Field(None, description="Subgroup label (e.g. 'Female', '<75 yr')")
+    n: Optional[str] = Field(None, description="Sample size annotation (e.g. '286 vs 145')")
+    hr: Optional[float] = Field(None, description="Hazard ratio (required for data rows)")
+    ci_low: Optional[float] = Field(None, description="95% CI lower bound")
+    ci_high: Optional[float] = Field(None, description="95% CI upper bound")
+    is_overall: Optional[bool] = Field(
+        None, description="True if this is the 'All patients' row (rendered as diamond)"
+    )
+    hr_text: Optional[str] = Field(
+        None,
+        description="Optional pre-formatted HR text; falls back to '{hr:.2f} ({ci_low:.2f}–{ci_high:.2f})'",
+    )
+
+
+class ForestPlotRequest(BaseModel):
+    subgroups: list[ForestSubgroup] = Field(
+        ..., min_length=1, description="Ordered list of subgroup rows (headers + data rows)"
+    )
+    title: Optional[str] = Field("", description="Plot title")
+    subtitle: Optional[str] = Field("", description="Plot subtitle")
+    favours_left: Optional[str] = Field(
+        "experimental better", description="Short generic label under the left arrow (max ~20 chars, e.g. 'experimental better')"
+    )
+    favours_right: Optional[str] = Field(
+        "control better", description="Short generic label under the right arrow (max ~20 chars, e.g. 'control better')"
+    )
+    reference_line: Optional[float] = Field(1.0, description="Null-effect HR (default 1.0)")
+    source: Optional[str] = Field(
+        "", description="Citation used in the 'Reconstructed from …' footer (liability marker)"
+    )
+    dpi: Optional[int] = Field(300, description="Output DPI")
+
+
 @app.post("/extract-forest-from-pdf")
 def extract_forest_from_pdf_endpoint(req: ExtractForestFromPDFRequest):
     """
@@ -207,6 +253,41 @@ def extract_forest_from_pdf_endpoint(req: ExtractForestFromPDFRequest):
     except Exception as e:
         traceback.print_exc()
         logger.error(f"extract-forest-from-pdf error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/charts/forest-plot")
+def forest_plot_endpoint(req: ForestPlotRequest):
+    """
+    POST /charts/forest-plot — Render a NEJM-style subgroup forest plot from
+    STRUCTURED data. This is the reconstruction-based counterpart to
+    /extract-forest-from-pdf.
+
+    The caller supplies subgroup rows (headers + data) with HR and 95% CI.
+    The renderer produces the platform's own visualisation; the "Reconstructed
+    from {source}" footer makes the liability model explicit (matches KM
+    curves, confidence tier 2). No copyright exposure — own visualisation of
+    data the caller already extracted from the paper.
+
+    Response: binary PNG (image/png), 300 DPI by default.
+    """
+    try:
+        png_bytes = render_forest_nejm(
+            subgroups=[sg.model_dump(exclude_none=True) for sg in req.subgroups],
+            title=req.title or "",
+            subtitle=req.subtitle or "",
+            favours_left=req.favours_left or "experimental better",
+            favours_right=req.favours_right or "control better",
+            reference_line=req.reference_line if req.reference_line is not None else 1.0,
+            source=req.source or "",
+            dpi=req.dpi or 300,
+        )
+        return Response(content=png_bytes, media_type="image/png")
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"forest-plot render error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
