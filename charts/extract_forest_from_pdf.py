@@ -17,9 +17,20 @@ embedding directly into a forest_pic_light slide.
 from __future__ import annotations
 
 import base64
+import re
 from typing import Optional
 
 import fitz  # PyMuPDF
+
+
+# Phase 3B fix — strong positive signal.
+# Matches figure captions like "Figure 3. Subgroup Analysis of Overall Survival"
+# or "Figure 4. Forest Plot of ...". Limited to 120 chars after the period so we
+# don't accidentally match prose that mentions "figure" earlier in the paragraph.
+FIGURE_CAPTION_PAT = re.compile(
+    r'figure\s+\d+\.\s*[^\n.]{0,120}?(subgroup|forest)',
+    re.IGNORECASE,
+)
 
 
 # Keywords used to score pages. Weighted: the ones that almost never
@@ -57,8 +68,22 @@ KM_INDICATORS = {
 }
 
 
-def _score_page(text: str) -> tuple[int, int]:
-    """Return (forest_score, km_penalty)."""
+def _score_page(text: str, drawing_count: int = 0) -> dict:
+    """Return detailed page-scoring breakdown.
+
+    Phase 3B change — returns a dict instead of tuple so the caller can log and
+    tie-break on individual components. Two strong new signals:
+
+      - figure_caption_bonus: +15 when a "Figure N. ... (Subgroup|Forest)" caption
+        is detected. Near-perfect binary: only the real forest-plot page matches
+        in typical journal articles.
+      - drawing_bonus: +3 for pages with ≥30 vector drawings, +6 for ≥100.
+        Forest plots are drawing-dense (diamonds, whiskers, ticks per subgroup).
+        Prose pages have 0-5 drawings.
+
+    These two signals are what separates a real figure page from a prose page
+    that happens to mention "subgroup" and "95% CI" in running text.
+    """
     t = text.lower()
     forest_score = 0
     for kw, w in FOREST_KEYWORDS.items():
@@ -68,7 +93,24 @@ def _score_page(text: str) -> tuple[int, int]:
     for kw, w in KM_INDICATORS.items():
         if kw in t:
             km_penalty += w
-    return forest_score, km_penalty
+    # Figure caption match (strong +15)
+    cap_bonus = 15 if FIGURE_CAPTION_PAT.search(t) else 0
+    # Graduated drawing-count bonus (weak but useful for tie-breaking)
+    if drawing_count >= 100:
+        drawing_bonus = 6
+    elif drawing_count >= 30:
+        drawing_bonus = 3
+    else:
+        drawing_bonus = 0
+    effective = forest_score - km_penalty + cap_bonus + drawing_bonus
+    return {
+        "forest": forest_score,
+        "km_penalty": km_penalty,
+        "figure_caption_bonus": cap_bonus,
+        "drawing_bonus": drawing_bonus,
+        "drawing_count": drawing_count,
+        "effective": effective,
+    }
 
 
 def _find_figure_bbox(page) -> Optional[fitz.Rect]:
@@ -193,7 +235,7 @@ def _render_page_crop(page, bbox: Optional[fitz.Rect], dpi: int = 400) -> bytes:
 def extract_forest_from_pdf(
     pdf_base64: str,
     study_name: Optional[str] = None,
-    min_score: int = 4,
+    min_score: int = 8,
 ) -> dict:
     """Detect and extract the Forest Plot figure from a full PDF publication.
 
@@ -201,16 +243,22 @@ def extract_forest_from_pdf(
     returns the cropped PNG which already contains all subgroup labels,
     N-values, HR values, diamonds, and whiskers.
 
+    Phase 3B — stricter detection. Default min_score raised from 4 to 8 so prose
+    pages that merely mention "subgroup" + "95% CI" in running text do NOT qualify.
+    A real forest-plot page will score ≥20 thanks to the figure_caption_bonus and
+    drawing_bonus additions.
+
     Returns:
       - png_base64:            the 400 DPI crop (same as figure_crop_base64)
       - figure_crop_base64:    the 400 DPI crop
       - page_number:           1-indexed page where the figure was found
-      - pdf_keyword_score:     the keyword score of the selected page
-      - page_scores:           list of (forest_score, km_penalty) per page
+      - pdf_keyword_score:     the effective score of the selected page
+      - page_scores:           list of per-page scoring detail dicts (see _score_page)
       - confidence_tier:       3 (always — we cannot validate forest data
                                   against text in the same way we do for KM
                                   medians, so we always report tier 3)
       - source:                file source marker (filled in by caller)
+      - bbox_found:            whether a figure bounding box could be isolated
     """
     if pdf_base64.startswith("data:"):
         pdf_base64 = pdf_base64.split(",", 1)[1]
@@ -221,35 +269,43 @@ def extract_forest_from_pdf(
     except Exception as e:
         raise ValueError(f"Invalid PDF: {e}")
 
-    # ---- 1. Score all pages ----
-    best_idx = -1
-    best_score = 0
+    # ---- 1. Score all pages (Phase 3B: now with drawing count + caption bonus) ----
     scores: list[dict] = []
     for i, page in enumerate(doc):
         try:
             text = page.get_text("text")
         except Exception:
             text = ""
-        forest_score, km_penalty = _score_page(text)
-        # Subtract km_penalty to avoid picking KM pages that also mention HR
-        effective = forest_score - km_penalty
-        scores.append({
-            "page": i + 1,
-            "forest": forest_score,
-            "km_penalty": km_penalty,
-            "effective": effective,
-        })
-        if effective > best_score:
-            best_score = effective
-            best_idx = i
+        try:
+            drawing_count = len(page.get_drawings())
+        except Exception:
+            drawing_count = 0
+        detail = _score_page(text, drawing_count)
+        detail["page"] = i + 1
+        scores.append(detail)
 
-    if best_idx < 0 or best_score < min_score:
+    # ---- 2. Pick winner with explicit tie-breaker ----
+    # Primary:   highest effective score
+    # Tiebreak1: page with a figure_caption_bonus wins over one without
+    # Tiebreak2: more drawings wins (real figure > prose)
+    # Tiebreak3: earlier page wins (stable)
+    ranked = sorted(
+        scores,
+        key=lambda s: (-s["effective"], -s["figure_caption_bonus"], -s["drawing_count"], s["page"]),
+    )
+    winner = ranked[0] if ranked else None
+
+    if winner is None or winner["effective"] < min_score:
         doc.close()
+        best_eff = winner["effective"] if winner else 0
         raise ValueError(
             f"No Forest Plot figure detected "
-            f"(best effective score = {best_score}, threshold = {min_score})"
+            f"(best effective score = {best_eff}, threshold = {min_score}). "
+            f"Frontend will skip the Forest Plot slide."
         )
 
+    best_idx = winner["page"] - 1
+    best_score = winner["effective"]
     page = doc[best_idx]
 
     # ---- 2. Figure bbox via vector drawings ----
