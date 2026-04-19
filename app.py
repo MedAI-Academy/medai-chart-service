@@ -23,6 +23,7 @@ import numpy as np
 from charts.kaplan_meier import render_kaplan_meier
 from charts.extract_km import extract_km
 from charts.extract_km_from_pdf import extract_km_from_pdf
+from charts.extract_forest_from_pdf import extract_forest_from_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,62 @@ def extract_km_from_pdf_endpoint(req: ExtractKMFromPDFRequest):
     except Exception as e:
         traceback.print_exc()
         logger.error(f"extract-km-from-pdf error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ══════════════════════════════════════════════════════════════════
+# FOREST PLOT EXTRACTION — Crop from PDF (no pixel tracing)
+# ══════════════════════════════════════════════════════════════════
+
+class ExtractForestFromPDFRequest(BaseModel):
+    pdf_base64: str = Field(..., description="Full PDF document as base64")
+    study_name: Optional[str] = Field(
+        None, description="Optional study name for reference lookup"
+    )
+    min_score: int = Field(
+        4,
+        description="Minimum effective keyword score (forest - km_penalty) "
+                    "required to accept a page as a Forest Plot page",
+    )
+
+
+@app.post("/extract-forest-from-pdf")
+def extract_forest_from_pdf_endpoint(req: ExtractForestFromPDFRequest):
+    """
+    POST /extract-forest-from-pdf — Extract Forest Plot figures from a full PDF.
+
+    Scans every page for forest-plot-specific keywords ("subgroup analysis",
+    "favours", "forest plot", "hazard ratio", ...), subtracts KM-page
+    indicators to avoid false positives, picks the best-scoring page,
+    auto-crops the figure at 400 DPI, and returns the crop directly.
+
+    Unlike /extract-km-from-pdf, this does NOT reconstruct the plot —
+    the original figure already contains all subgroup labels, N-values,
+    HR values, diamonds, and whiskers at publication quality.
+
+    Response:
+      - png_base64:            the 400 DPI PNG crop
+      - figure_crop_base64:    same (for compatibility with KM response shape)
+      - page_number:           1-indexed page where the figure was found
+      - pdf_keyword_score:     the effective score of the selected page
+      - page_scores:           list per page with forest/km_penalty/effective
+      - confidence_tier:       always 3 (original figure, not reconstructed)
+      - source:                study_name if provided
+      - bbox_found:            true if a figure cluster was detected, false
+                               if we fell back to rendering the whole page
+    """
+    try:
+        result = extract_forest_from_pdf(
+            pdf_base64=req.pdf_base64,
+            study_name=req.study_name,
+            min_score=req.min_score,
+        )
+        return JSONResponse(result)
+    except ValueError as ve:
+        return JSONResponse({"error": str(ve)}, status_code=400)
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"extract-forest-from-pdf error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
