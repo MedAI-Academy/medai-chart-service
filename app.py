@@ -169,6 +169,15 @@ class ExtractForestFromPDFRequest(BaseModel):
         description="Minimum effective keyword score (forest - km_penalty) "
                     "required to accept a page as a Forest Plot page",
     )
+    extract_subgroups: bool = Field(
+        True,
+        description="If True (default), pass the cropped figure to Gemini Vision "
+                    "to extract structured subgroup data (name, n, hr, ci_low, "
+                    "ci_high). The frontend uses this to render its own "
+                    "NEJM-style forest plot via /charts/forest-plot. Set False "
+                    "to skip the Gemini call (cheaper, but loses Tier 2 "
+                    "confidence promotion and the structured subgroups[] payload).",
+    )
 
 
 # ── Phase 4A: reconstruction-based forest plot ────────────────────
@@ -224,28 +233,50 @@ def extract_forest_from_pdf_endpoint(req: ExtractForestFromPDFRequest):
     Scans every page for forest-plot-specific keywords ("subgroup analysis",
     "favours", "forest plot", "hazard ratio", ...), subtracts KM-page
     indicators to avoid false positives, picks the best-scoring page,
-    auto-crops the figure at 400 DPI, and returns the crop directly.
+    auto-crops the figure at 400 DPI, and (Phase 4D) optionally passes the
+    crop through Gemini Vision to extract structured subgroup data.
 
-    Unlike /extract-km-from-pdf, this does NOT reconstruct the plot —
-    the original figure already contains all subgroup labels, N-values,
-    HR values, diamonds, and whiskers at publication quality.
+    Two modes (controlled by `extract_subgroups`):
 
-    Response:
-      - png_base64:            the 400 DPI PNG crop
-      - figure_crop_base64:    same (for compatibility with KM response shape)
-      - page_number:           1-indexed page where the figure was found
-      - pdf_keyword_score:     the effective score of the selected page
-      - page_scores:           list per page with forest/km_penalty/effective
-      - confidence_tier:       always 3 (original figure, not reconstructed)
-      - source:                study_name if provided
-      - bbox_found:            true if a figure cluster was detected, false
-                               if we fell back to rendering the whole page
+    1. extract_subgroups=True (DEFAULT) — full Phase 4D pipeline:
+         - Crop the figure as before (always returned)
+         - Plus call Gemini Vision to read off subgroup labels, N-values,
+           HR and 95% CI for each row
+         - Confidence tier promoted to 2 if ≥1 data row was extracted
+           (frontend can then render its own NEJM-style plot via
+           /charts/forest-plot — no copyright exposure on the slide)
+         - Soft-fails: if Gemini errors out, the crop is still returned,
+           subgroups stays empty, and `subgroups_error` carries the reason
+
+    2. extract_subgroups=False — legacy crop-only mode:
+         - Cheap, fast, no Gemini call
+         - Confidence tier stays at 3 (raw original-figure crop)
+
+    Response (always present):
+      - png_base64 / figure_crop_base64:  the 400 DPI crop
+      - page_number:                      1-indexed page where figure was found
+      - pdf_keyword_score:                effective score of selected page
+      - page_scores:                      per-page scoring detail
+      - confidence_tier:                  2 if subgroups extracted, else 3
+      - source:                           study_name if provided
+      - bbox_found:                       true if figure cluster was detected
+
+    Response (added when extract_subgroups=True):
+      - subgroups:                        list of {name,n,hr,ci_low,ci_high,…}
+                                          or {is_header,category} group separators
+      - subgroups_count:                  number of data rows (excluding headers)
+      - subgroups_dropped_count:          rows Gemini returned but validation rejected
+      - subgroups_extraction_method:      Gemini model id ACTUALLY used (primary or fallback)
+      - subgroups_favours_left/right:     arrow labels read from the plot
+      - subgroups_figure_title:           figure title/caption read from the image
+      - subgroups_error:                  error string if Gemini failed, else None
     """
     try:
         result = extract_forest_from_pdf(
             pdf_base64=req.pdf_base64,
             study_name=req.study_name,
             min_score=req.min_score,
+            extract_subgroups=req.extract_subgroups,
         )
         return JSONResponse(result)
     except ValueError as ve:
