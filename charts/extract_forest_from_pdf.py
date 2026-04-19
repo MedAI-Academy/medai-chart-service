@@ -6,21 +6,29 @@ Pipeline:
   2. Pick the best page (distinct from KM pages via KM-penalty).
   3. Find the largest figure bounding box via PyMuPDF drawings.
   4. Render that bbox at 400 DPI as PNG.
-  5. Return the crop — no pixel tracing needed.
+  5. (Phase 4D) Optionally pass the PNG through Gemini Vision to extract
+     structured subgroup data {name, n, hr, ci_low, ci_high}. The frontend
+     uses this to render its own NEJM-style forest plot via Phase 4A's
+     /charts/forest-plot endpoint — no copyright exposure, "Reconstructed
+     from {paper}" footer as liability marker, confidence tier promoted
+     from 3 (raw crop) to 2 (own visualisation of extracted data).
 
-Unlike KM extraction, we do NOT reconstruct the plot. The original
-figure already contains all the necessary information (subgroup labels,
-N-values, HR values, diamonds, whiskers). The crop is good enough for
-embedding directly into a forest_pic_light slide.
+The PNG crop is still returned regardless of subgroup extraction success,
+so callers that only want the figure crop continue to work unchanged.
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from typing import Optional
 
 import fitz  # PyMuPDF
+
+from .extract_forest_subgroups_gemini import extract_forest_subgroups_gemini
+
+logger = logging.getLogger(__name__)
 
 
 # Phase 3B fix — strong positive signal.
@@ -236,29 +244,61 @@ def extract_forest_from_pdf(
     pdf_base64: str,
     study_name: Optional[str] = None,
     min_score: int = 8,
+    extract_subgroups: bool = True,
 ) -> dict:
     """Detect and extract the Forest Plot figure from a full PDF publication.
 
-    Unlike KM extraction, this does NOT reconstruct the plot — it simply
-    returns the cropped PNG which already contains all subgroup labels,
-    N-values, HR values, diamonds, and whiskers.
+    Pipeline (Phase 4D):
+      1. Score all PDF pages, pick the one with the strongest forest-plot
+         signal (keywords + figure caption + drawing density).
+      2. Crop the figure bbox at 400 DPI → PNG.
+      3. (Optional, default ON) Pass the PNG through Gemini Vision to extract
+         structured subgroup data {name, n, hr, ci_low, ci_high}. The frontend
+         feeds those into Phase 4A's NEJM-style renderer for an own-IP forest
+         plot — no copyright exposure on the slide itself.
 
-    Phase 3B — stricter detection. Default min_score raised from 4 to 8 so prose
-    pages that merely mention "subgroup" + "95% CI" in running text do NOT qualify.
-    A real forest-plot page will score ≥20 thanks to the figure_caption_bonus and
-    drawing_bonus additions.
+    Confidence tier:
+      - 3 (raw original-figure crop) if no subgroups extracted
+      - 2 (own visualisation reconstructed from extracted data) if ≥1 data row
+
+    Failure handling:
+      - PDF parse / page detection / bbox / crop failures → exceptions as before
+      - Gemini extraction failure (timeout, invalid JSON, model down) → soft-fail:
+        crop is still returned, subgroups stays empty, confidence_tier stays at 3,
+        and the error is surfaced as `subgroups_error` so the caller can log it.
+        The original cropping pipeline is never broken by Gemini issues.
+
+    Args:
+      pdf_base64:        Full PDF as base64.
+      study_name:        Optional study name (for footer "Reconstructed from …"
+                         and as logging context — NOT sent to Gemini, so the
+                         model has to read the figure rather than recall memory).
+      min_score:         Minimum effective keyword score to accept a page.
+      extract_subgroups: If True (default), call Gemini Vision on the crop.
+                         Set False to skip — useful for cheap re-runs that
+                         only need the figure crop.
 
     Returns:
-      - png_base64:            the 400 DPI crop (same as figure_crop_base64)
-      - figure_crop_base64:    the 400 DPI crop
-      - page_number:           1-indexed page where the figure was found
-      - pdf_keyword_score:     the effective score of the selected page
-      - page_scores:           list of per-page scoring detail dicts (see _score_page)
-      - confidence_tier:       3 (always — we cannot validate forest data
-                                  against text in the same way we do for KM
-                                  medians, so we always report tier 3)
-      - source:                file source marker (filled in by caller)
-      - bbox_found:            whether a figure bounding box could be isolated
+      Always present:
+        - png_base64:               the 400 DPI crop
+        - figure_crop_base64:       same (compat with KM response shape)
+        - page_number:              1-indexed page where figure was found
+        - pdf_keyword_score:        effective score of selected page
+        - page_scores:              per-page scoring detail (see _score_page)
+        - confidence_tier:          2 if ≥1 subgroup extracted, else 3
+        - source:                   study_name (or "")
+        - bbox_found:               whether figure bbox was isolated
+
+      Added when extract_subgroups=True (always present, may be empty):
+        - subgroups:                list of {name,n,hr,ci_low,ci_high,…} or
+                                    {is_header,category}
+        - subgroups_count:          number of data rows (excluding headers)
+        - subgroups_dropped_count:  rows Gemini returned but validation rejected
+        - subgroups_extraction_method: model id actually used (primary or fallback)
+        - subgroups_favours_left:   left arrow label from the plot
+        - subgroups_favours_right:  right arrow label from the plot
+        - subgroups_figure_title:   figure title/caption read from the image
+        - subgroups_error:          error string if Gemini failed, else None
     """
     if pdf_base64.startswith("data:"):
         pdf_base64 = pdf_base64.split(",", 1)[1]
@@ -317,17 +357,71 @@ def extract_forest_from_pdf(
 
     doc.close()
 
-    # ---- 4. Return result — NO extract_km-style pixel tracing ----
-    # The crop itself IS the output. The Forest Plot figure in the PDF
-    # already has all labels, diamonds, and numbers rendered at publication
-    # quality. We hand it straight to the PPTX renderer via figurePng.
+    # ---- 4. Optional Phase 4D: Gemini Vision subgroup extraction ----
+    # The crop is everything we need for the legacy "embed original figure"
+    # path. For the Phase 4A reconstruction path we also pass the crop to
+    # Gemini Vision and ask for structured {name, n, hr, ci_low, ci_high}.
+    # The extraction is best-effort: any failure leaves the original crop
+    # response intact and just marks subgroups as empty + records the error.
+    subgroups_payload: dict = {
+        "subgroups": [],
+        "subgroups_count": 0,
+        "subgroups_dropped_count": 0,
+        "subgroups_extraction_method": None,
+        "subgroups_favours_left": None,
+        "subgroups_favours_right": None,
+        "subgroups_figure_title": None,
+        "subgroups_error": None,
+    }
+
+    if extract_subgroups:
+        try:
+            gem = extract_forest_subgroups_gemini(
+                image_base64=png_b64,
+                source_hint=study_name,
+            )
+            data_rows = [sg for sg in gem.get("subgroups", []) if not sg.get("is_header")]
+            subgroups_payload.update({
+                "subgroups":                  gem.get("subgroups", []),
+                "subgroups_count":            len(data_rows),
+                "subgroups_dropped_count":    len(gem.get("dropped_rows", [])),
+                "subgroups_extraction_method": gem.get("extraction_method"),
+                "subgroups_favours_left":     gem.get("favours_left"),
+                "subgroups_favours_right":    gem.get("favours_right"),
+                "subgroups_figure_title":     gem.get("title"),
+                "subgroups_error":            gem.get("error"),
+            })
+            if gem.get("error"):
+                logger.warning(
+                    f"Gemini subgroup extraction returned error for "
+                    f"study_name='{study_name}': {gem['error']}"
+                )
+        except Exception as e:
+            # Belt-and-braces — the wrapper itself promises never to raise,
+            # but if something unexpected slips through we still want the
+            # crop pipeline to succeed. Log and move on.
+            logger.error(
+                f"Unexpected error during Gemini subgroup extraction for "
+                f"study_name='{study_name}': {e}"
+            )
+            subgroups_payload["subgroups_error"] = f"Unexpected: {e}"
+
+    # ---- 5. Confidence tier promotion ----
+    # Tier 3 = original figure crop (no own visualisation, copyright exposure).
+    # Tier 2 = own visualisation reconstructed from extracted data
+    #         (with "Reconstructed from {paper}" footer as liability marker).
+    # We only promote to Tier 2 when we actually have data rows the frontend
+    # can use to render its own plot.
+    confidence_tier = 2 if subgroups_payload["subgroups_count"] > 0 else 3
+
     return {
-        "png_base64": png_b64,
-        "figure_crop_base64": png_b64,
-        "page_number": best_idx + 1,
-        "pdf_keyword_score": best_score,
-        "page_scores": scores,
-        "confidence_tier": 3,  # Always tier 3 — original figure, not reconstructed
-        "source": study_name or "",
-        "bbox_found": bbox is not None,
+        "png_base64":                 png_b64,
+        "figure_crop_base64":         png_b64,
+        "page_number":                best_idx + 1,
+        "pdf_keyword_score":          best_score,
+        "page_scores":                scores,
+        "confidence_tier":            confidence_tier,
+        "source":                     study_name or "",
+        "bbox_found":                 bbox is not None,
+        **subgroups_payload,
     }
