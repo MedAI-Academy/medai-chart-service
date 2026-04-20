@@ -61,8 +61,13 @@ logger = logging.getLogger(__name__)
 # the new string — no code change required. The result dict's
 # `extraction_method` field will always show which model actually served
 # the request, so debugging is trivial.
-GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_FOREST_MODEL",          "gemini-3-flash-preview")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FOREST_FALLBACK_MODEL", "gemini-2.5-flash")
+# `or` (instead of os.environ.get's default arg) ensures the code default
+# kicks in for BOTH cases:
+#   1. env var not set at all
+#   2. env var set to empty string (e.g. operator created the Railway var
+#      with an empty value field) ← we hit this 2026-04-20, hence the `or`
+GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_FOREST_MODEL")          or "gemini-3-flash-preview"
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FOREST_FALLBACK_MODEL") or "gemini-2.5-flash"
 GEMINI_TIMEOUT_SECONDS = 60
 
 # Substrings (lowercased) in the exception message that mean "this model
@@ -80,6 +85,7 @@ _MODEL_UNAVAILABLE_INDICATORS = (
     "unsupported model",
     "is not supported",
     "does not exist",
+    "unexpected model name",   # added 2026-04-20: empty/malformed model id
 )
 
 # Strict extraction prompt. Two design choices worth noting:
