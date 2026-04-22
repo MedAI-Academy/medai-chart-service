@@ -1,30 +1,57 @@
 """
-Kaplan-Meier extraction from full PDF publications.
+Kaplan-Meier extraction from full PDF publications via Gemini Vision.
 
-Pipeline:
-  1. Iterate all pages, score each by KM-figure keyword density.
+This is the Phase 5 replacement for the OpenCV pixel-tracing pipeline that
+shipped before. The new pipeline:
+
+  1. Scan all pages, score each by KM-figure keyword density (UNCHANGED
+     from the previous pipeline — keyword scoring works well).
   2. Pick the best page.
-  3. Find the largest figure bounding box via PyMuPDF drawings (vector
-     shapes) with a fallback to the whole page.
-  4. Render that bbox at 400 DPI as PNG.
-  5. Feed the crop into extract_km (HSV pixel extraction).
+  3. Find the largest figure bounding box via PyMuPDF drawings (UNCHANGED).
+  4. Render that bbox at 400 DPI as PNG (UNCHANGED).
+  5. NEW: send the crop to Gemini Vision (extract_km_vision_gemini, three
+     parallel passes: metadata, NaR, curve coordinates).
+  6. NEW: validate the curve coordinates against published medians.
+  7. NEW: render an own NEJM-style PNG from the validated coordinates
+     (km_render_nejm). The rendered PNG is what the slide embeds —
+     never the original figure crop, which avoids copyright issues and
+     gives us full control over visual quality.
+
+Confidence tier mapping:
+    Tier 1: not used (would require comparing to known reference data —
+            we don't maintain a STUDY_REFERENCE table any more)
+    Tier 2: vision extraction succeeded AND median validation matched
+            (verdict == "match" within ±10% tolerance)
+    Tier 3: vision extraction succeeded but median validation flagged
+            warn (10-25% deviation, retry already applied) OR no
+            published anchor available
+    None  : extraction failed entirely (hard_fail or worse) — no PNG
+            returned, error message set so the frontend can show a
+            user-facing message.
+
+Backwards compatibility: response shape is intentionally a superset of
+the previous shape. The frontend only consumed `png_base64`, `page_number`,
+`error`, and `confidence_tier`, all of which are still here. New fields
+(`vision_data`, `median_validation`, `extraction_methods`) are optional —
+the frontend will eventually use them for richer UI but doesn't need to
+yet.
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Optional
 
 import fitz  # PyMuPDF
 
-import cv2
-import numpy as np
+from charts.extract_km_vision_gemini import extract_km_vision
+from charts.km_render_nejm import render_km_from_vision
 
-from charts.extract_km import extract_km, detect_plot_bounds
+logger = logging.getLogger(__name__)
 
 
-# Keywords used to score pages. Weighted: the ones that almost never
-# appear outside KM figures score higher.
+# Same keyword set as before — KM figures consistently use these terms.
 KM_KEYWORDS = {
     "no. at risk": 4,
     "number at risk": 4,
@@ -57,6 +84,8 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
     KM figures are typically composed of many line/rect drawings (axes,
     curve segments, tick marks). We cluster drawings by proximity and
     return the largest cluster's union bbox.
+
+    UNCHANGED from the old pipeline — this part works well.
     """
     try:
         drawings = page.get_drawings()
@@ -68,13 +97,10 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
         r = d.get("rect")
         if r is None:
             continue
-        # Accept lines (w or h == 0). Drop zero-sized points only.
         if r.width < 1 and r.height < 1:
             continue
-        # Skip drawings that span (almost) the whole page
         if r.width > page_rect.width * 0.9 and r.height > page_rect.height * 0.9:
             continue
-        # Skip zero-width/height lines that are page borders
         if r.width > page_rect.width * 0.9 or r.height > page_rect.height * 0.9:
             continue
         rects.append(r)
@@ -82,9 +108,7 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
     if not rects:
         return None
 
-    # Cluster rects: two rects belong to the same cluster if they are
-    # within a small gap of each other. Use a fixed 12 pt gap — KM
-    # figures consist of tightly-spaced line segments.
+    # Cluster rects within a 12pt gap
     gap = 12.0
     clusters: list[list[fitz.Rect]] = []
     for r in rects:
@@ -98,7 +122,7 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
         if not placed:
             clusters.append([r])
 
-    # Merge overlapping clusters (2-pass union)
+    # Merge overlapping clusters
     for _ in range(2):
         merged: list[list[fitz.Rect]] = []
         for cl in clusters:
@@ -118,9 +142,7 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
                 merged.append(cl)
         clusters = merged
 
-    # Pick the cluster whose union bbox has the largest area AND
-    # contains at least 15 drawings (smaller threshold helps figures
-    # drawn as a handful of long polylines).
+    # Pick the largest qualifying cluster
     best: Optional[fitz.Rect] = None
     best_area = 0.0
     for cl in clusters:
@@ -130,7 +152,6 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
         for r in cl[1:]:
             union.include_rect(r)
         area = union.width * union.height
-        # Figure must occupy at least 8 % of the page area but not > 85 %.
         page_area = page_rect.width * page_rect.height
         if area < page_area * 0.08 or area > page_area * 0.85:
             continue
@@ -141,16 +162,14 @@ def _find_figure_bbox(page) -> Optional[fitz.Rect]:
     if best is None:
         return None
 
-    # Pad the bbox slightly so tick labels and axis titles that live
-    # just outside the drawing cluster are included in the crop.
-    pad = 12  # points
-    padded = fitz.Rect(
+    # Pad slightly to include axis labels
+    pad = 12
+    return fitz.Rect(
         max(page.rect.x0, best.x0 - pad),
         max(page.rect.y0, best.y0 - pad),
         min(page.rect.x1, best.x1 + pad),
         min(page.rect.y1, best.y1 + pad),
     )
-    return padded
 
 
 def _render_page_crop(page, bbox: Optional[fitz.Rect], dpi: int = 400) -> bytes:
@@ -164,18 +183,80 @@ def _render_page_crop(page, bbox: Optional[fitz.Rect], dpi: int = 400) -> bytes:
     return pix.tobytes("png")
 
 
+def _compute_confidence_tier(vision_data: dict) -> int:
+    """Map the vision_data state to the integer confidence tier.
+
+    Tier 2 = matched against published median (best we can offer
+             without reference IPD)
+    Tier 3 = extracted but validation soft-failed or no anchor
+    """
+    mv = vision_data.get("median_validation") or {}
+    verdict = mv.get("verdict")
+    if verdict == "match":
+        # Did we actually validate against any published anchor, or did
+        # all arms come back "unverifiable" (no published median)?
+        any_validated = any(
+            (ar.get("status") == "match")
+            for ar in (mv.get("arm_results") or [])
+        )
+        return 2 if any_validated else 3
+    elif verdict == "needs_reextract":
+        # Soft warn — kept the extraction but median didn't fully match
+        return 3
+    elif verdict == "hard_fail":
+        # Should not be called in the success path — we set png to None
+        # before this. Returning 3 as defensive default.
+        return 3
+    else:
+        return 3
+
+
 def extract_km_from_pdf(
     pdf_base64: str,
     study_name: Optional[str] = None,
     min_score: int = 4,
 ) -> dict:
-    """Detect and extract the KM figure from a full PDF publication.
+    """Detect and extract the KM figure from a full PDF publication, then
+    re-render via Gemini Vision + Vision-renderer.
 
-    Returns the same shape as extract_km() plus:
-      - page_number:           1-indexed page where the figure was found
-      - figure_crop_base64:    the 400 DPI crop that was sent to extract_km
-      - pdf_keyword_score:     the keyword score of the selected page
+    Args:
+        pdf_base64: full PDF as base64 string (with or without data: prefix)
+        study_name: optional paper/study name for the validation footer
+                    on the rendered PNG (e.g. "DiNardo et al., NEJM 2020").
+                    Also used as `source_hint` for vision extraction logging.
+        min_score: minimum keyword score for accepting a page as KM-bearing.
+
+    Returns:
+        dict with these keys (always present, even on failure):
+          - png_base64:           base64 of the rendered NEJM-style PNG.
+                                  EMPTY STRING if extraction failed; check
+                                  `error` for the reason.
+          - page_number:          1-indexed page where the figure was found,
+                                  or None if no KM page detected.
+          - figure_crop_base64:   base64 of the source crop sent to Vision
+                                  (useful for debugging — frontend doesn't
+                                  embed this).
+          - pdf_keyword_score:    keyword score of the selected page.
+          - page_scores:          list of keyword scores per page.
+          - confidence_tier:      2 (matched against published median),
+                                  3 (extracted but soft warn / no anchor),
+                                  or None (extraction failed).
+          - vision_data:          full dict from extract_km_vision (metadata,
+                                  NaR, curve_arms, etc.). Useful for the
+                                  frontend if it wants to display NaR-only
+                                  fallback when the renderer returns no PNG.
+          - median_validation:    convenience copy of vision_data.median_validation
+                                  for frontend access without traversing.
+          - extraction_methods:   convenience dict of model IDs used per pass.
+          - error:                None on success, or a string describing
+                                  why the slide cannot be built. Frontend
+                                  should display this to the user.
+
+    Raises:
+        ValueError on invalid PDF or no KM page detected (caught by the
+        FastAPI endpoint and returned as 400).
     """
+    # ---- 1. Decode + open PDF ----
     if pdf_base64.startswith("data:"):
         pdf_base64 = pdf_base64.split(",", 1)[1]
     pdf_bytes = base64.b64decode(pdf_base64)
@@ -185,7 +266,7 @@ def extract_km_from_pdf(
     except Exception as e:
         raise ValueError(f"Invalid PDF: {e}")
 
-    # ---- 1. Score all pages ----
+    # ---- 2. Score all pages ----
     best_idx = -1
     best_score = 0
     scores: list[int] = []
@@ -209,44 +290,94 @@ def extract_km_from_pdf(
 
     page = doc[best_idx]
 
-    # ---- 2. Figure bbox via vector drawings ----
+    # ---- 3. Figure bbox via vector drawings ----
     bbox = _find_figure_bbox(page)
 
-    # ---- 3. Render at 400 DPI ----
+    # ---- 4. Render at 400 DPI ----
     png_bytes = _render_page_crop(page, bbox, dpi=400)
-    png_b64 = base64.b64encode(png_bytes).decode("ascii")
+    crop_b64 = base64.b64encode(png_bytes).decode("ascii")
 
     doc.close()
 
-    # ---- 4. Auto-detect plot bounds ON THE NEW CROP ----
-    # STUDY_REFERENCE plot_bounds apply to the canonical PNG crops, not
-    # to freshly-rendered PDF pages. Detect on the rendered image and
-    # pass explicitly so the reference lookup for bounds is bypassed
-    # while name/colors/NaR/axis-ranges from ref are still used.
-    arr = np.frombuffer(png_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    detected_bounds = detect_plot_bounds(img)
+    logger.info(
+        f"KM page detected: page {best_idx + 1} (score {best_score}), "
+        f"crop {len(png_bytes)} bytes — sending to Vision"
+    )
 
-    # ---- 5. Delegate to existing extract_km ----
+    # ---- 5. Vision extraction (3 parallel passes) ----
+    vision_data = extract_km_vision(
+        image_base64=crop_b64,
+        source_hint=study_name or f"PDF page {best_idx + 1}",
+    )
+
+    # Common return scaffolding — populated below
+    response = {
+        "png_base64":         "",
+        "page_number":        best_idx + 1,
+        "figure_crop_base64": crop_b64,
+        "pdf_keyword_score":  best_score,
+        "page_scores":        scores,
+        "confidence_tier":    None,
+        "vision_data":        vision_data,
+        "median_validation":  vision_data.get("median_validation"),
+        "extraction_methods": {
+            "metadata": vision_data.get("extraction_method_metadata"),
+            "nar":      vision_data.get("extraction_method_nar"),
+            "curve":    vision_data.get("extraction_method_curve"),
+        },
+        "error":              None,
+    }
+
+    # ---- 5a. Extraction-level errors ----
+    # If vision extraction set its own error (hard_fail or model-down), pass
+    # it through verbatim — the wrapper formats user-friendly messages.
+    if vision_data.get("error"):
+        logger.warning(
+            f"Vision extraction returned error for page {best_idx + 1}: "
+            f"{vision_data['error']}"
+        )
+        response["error"] = vision_data["error"]
+        return response
+
+    # ---- 5b. No usable curve arms ----
+    # Vision succeeded but produced no curve coordinates we could validate.
+    # This happens if the figure is too low-resolution or the model
+    # hallucinated and we dropped everything in validation. Don't render
+    # a misleading slide — return the metadata so the frontend can decide.
+    if not vision_data.get("curve_arms"):
+        msg = (
+            "Vision extraction did not produce usable curve coordinates. "
+            "Title and metadata may still be available, but the curve itself "
+            "could not be reconstructed. Try a higher-resolution PDF, or "
+            "skip this KM slide."
+        )
+        logger.warning(f"Page {best_idx + 1}: {msg}")
+        response["error"] = msg
+        return response
+
+    # ---- 6. Render the NEJM-style PNG from the extracted coordinates ----
     try:
-        result = extract_km(
-            image_base64=png_b64,
-            study_name=study_name,
-            plot_bounds=detected_bounds,
+        rendered_png = render_km_from_vision(
+            vision_data,
+            source_name=study_name,
         )
     except Exception as e:
-        # Even if extraction fails, still return the crop so the caller
-        # can fall back to manual tooling.
-        return {
-            "error": f"extract_km failed on rendered crop: {e}",
-            "page_number": best_idx + 1,
-            "figure_crop_base64": png_b64,
-            "pdf_keyword_score": best_score,
-            "page_scores": scores,
-        }
+        logger.exception(f"Render failed for page {best_idx + 1}: {e}")
+        response["error"] = f"Render failed: {e}"
+        return response
 
-    result["page_number"] = best_idx + 1
-    result["figure_crop_base64"] = png_b64
-    result["pdf_keyword_score"] = best_score
-    result["page_scores"] = scores
-    return result
+    if rendered_png is None:
+        # render_km_from_vision returns None if curve_arms is empty.
+        # Should not happen here (we checked above) but defensive.
+        response["error"] = "Renderer returned no PNG (no curve data)"
+        return response
+
+    response["png_base64"]      = base64.b64encode(rendered_png).decode("ascii")
+    response["confidence_tier"] = _compute_confidence_tier(vision_data)
+
+    logger.info(
+        f"KM extraction complete for page {best_idx + 1}: "
+        f"{len(rendered_png)} bytes rendered, tier {response['confidence_tier']}, "
+        f"verdict={(response['median_validation'] or {}).get('verdict', 'n/a')}"
+    )
+    return response
