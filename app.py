@@ -20,8 +20,10 @@ import traceback
 import logging
 import numpy as np
 
-from charts.kaplan_meier import render_kaplan_meier
-from charts.extract_km import extract_km
+# Phase 5: KM extraction is now Vision-based (Gemini). The old kaplan_meier
+# (matplotlib IPD renderer) and extract_km (OpenCV pixel tracer) modules
+# have been removed — see charts/extract_km_from_pdf.py for the new
+# pipeline (PDF → keyword scoring → Vision passes → NEJM-style render).
 from charts.extract_km_from_pdf import extract_km_from_pdf
 from charts.extract_forest_from_pdf import extract_forest_from_pdf
 from charts.forest_plot_nejm import render_forest_nejm
@@ -39,27 +41,9 @@ app.add_middleware(
 
 
 # ── Request Models ──────────────────────────────────────────────
-
-class KMArm(BaseModel):
-    label: str = Field(..., description="Arm name, e.g. 'Pembrolizumab + Chemo'")
-    times: list[float] = Field(..., description="Event/censor times in months")
-    events: list[int] = Field(..., description="1 = event (death), 0 = censored")
-    color: Optional[str] = Field(None, description="Hex color override")
-
-
-class KMRequest(BaseModel):
-    arms: list[KMArm] = Field(..., min_length=1, max_length=4)
-    title: Optional[str] = Field(None, description="Chart title")
-    xlabel: Optional[str] = Field("Time (months)", description="X-axis label")
-    ylabel: Optional[str] = Field("Overall Survival (%)", description="Y-axis label")
-    show_ci: bool = Field(True, description="Show 95% confidence intervals")
-    show_censoring: bool = Field(True, description="Show censoring tick marks")
-    show_at_risk: bool = Field(True, description="Show number-at-risk table")
-    show_median: bool = Field(True, description="Show median survival lines")
-    hr_text: Optional[str] = Field(None, description="HR box text, e.g. 'HR 0.68 (95% CI 0.56–0.84); p<0.001'")
-    width: float = Field(10, description="Figure width in inches")
-    height: float = Field(7, description="Figure height in inches")
-    dpi: int = Field(300, description="Resolution")
+# Phase 5: KMArm + KMRequest models removed along with the
+# /charts/kaplan-meier endpoint — they served the old IPD-input
+# matplotlib renderer which is no longer in the call graph.
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -71,48 +55,15 @@ def health():
     return {"status": "ok", "version": "2.0.0", "engine": "FastAPI + python-pptx"}
 
 
-@app.post("/charts/kaplan-meier")
-def kaplan_meier(req: KMRequest):
-    buf = render_kaplan_meier(req)
-    return Response(content=buf.getvalue(), media_type="image/png")
-
 
 # ══════════════════════════════════════════════════════════════════
-# KM CURVE EXTRACTION — OpenCV pixel-level reader
+# KM CURVE EXTRACTION — Vision-based pipeline
 # ══════════════════════════════════════════════════════════════════
-
-class ArmColorHint(BaseModel):
-    name: str = Field(..., description="Arm name")
-    color_hint: Optional[str] = Field(
-        None,
-        description="Color hint: blue | green | red | orange | yellow | "
-                    "purple | black | gray (or German: dunkelblau, "
-                    "waldgruen, grau)",
-    )
-
-
-class ExtractKMRequest(BaseModel):
-    image_base64: str = Field(..., description="PNG or JPG as base64")
-    study_name: Optional[str] = Field(
-        None,
-        description="Optional study name (e.g. 'VIALE-A', 'AQUILA', 'CLEAR') "
-                    "for metadata lookup",
-    )
-    arm_colors: Optional[list[ArmColorHint]] = Field(
-        None,
-        description="Optional arm color hints. If omitted and study_name "
-                    "is unknown, arms are auto-detected.",
-    )
-    x_range: Optional[list[float]] = Field(
-        None, description="Optional axis range override [min, max]"
-    )
-    y_range: Optional[list[float]] = Field(
-        None, description="Optional Y-axis range override [min, max]"
-    )
-    plot_bounds: Optional[list[int]] = Field(
-        None,
-        description="Optional plot pixel bounds override [xl, yt, xr, yb]",
-    )
+# Phase 5: ArmColorHint + ExtractKMRequest models removed along with the
+# /extract-km endpoint — they served the old OpenCV pixel-tracing pipeline
+# which has been replaced by the Vision pipeline (see /extract-km-from-pdf).
+# Pre-cropped image extraction is no longer a public endpoint; if you need
+# to test on a single image, build a tiny PDF wrapping it and POST that.
 
 
 class ExtractKMFromPDFRequest(BaseModel):
@@ -169,15 +120,6 @@ class ExtractForestFromPDFRequest(BaseModel):
         description="Minimum effective keyword score (forest - km_penalty) "
                     "required to accept a page as a Forest Plot page",
     )
-    extract_subgroups: bool = Field(
-        True,
-        description="If True (default), pass the cropped figure to Gemini Vision "
-                    "to extract structured subgroup data (name, n, hr, ci_low, "
-                    "ci_high). The frontend uses this to render its own "
-                    "NEJM-style forest plot via /charts/forest-plot. Set False "
-                    "to skip the Gemini call (cheaper, but loses Tier 2 "
-                    "confidence promotion and the structured subgroups[] payload).",
-    )
 
 
 # ── Phase 4A: reconstruction-based forest plot ────────────────────
@@ -233,50 +175,28 @@ def extract_forest_from_pdf_endpoint(req: ExtractForestFromPDFRequest):
     Scans every page for forest-plot-specific keywords ("subgroup analysis",
     "favours", "forest plot", "hazard ratio", ...), subtracts KM-page
     indicators to avoid false positives, picks the best-scoring page,
-    auto-crops the figure at 400 DPI, and (Phase 4D) optionally passes the
-    crop through Gemini Vision to extract structured subgroup data.
+    auto-crops the figure at 400 DPI, and returns the crop directly.
 
-    Two modes (controlled by `extract_subgroups`):
+    Unlike /extract-km-from-pdf, this does NOT reconstruct the plot —
+    the original figure already contains all subgroup labels, N-values,
+    HR values, diamonds, and whiskers at publication quality.
 
-    1. extract_subgroups=True (DEFAULT) — full Phase 4D pipeline:
-         - Crop the figure as before (always returned)
-         - Plus call Gemini Vision to read off subgroup labels, N-values,
-           HR and 95% CI for each row
-         - Confidence tier promoted to 2 if ≥1 data row was extracted
-           (frontend can then render its own NEJM-style plot via
-           /charts/forest-plot — no copyright exposure on the slide)
-         - Soft-fails: if Gemini errors out, the crop is still returned,
-           subgroups stays empty, and `subgroups_error` carries the reason
-
-    2. extract_subgroups=False — legacy crop-only mode:
-         - Cheap, fast, no Gemini call
-         - Confidence tier stays at 3 (raw original-figure crop)
-
-    Response (always present):
-      - png_base64 / figure_crop_base64:  the 400 DPI crop
-      - page_number:                      1-indexed page where figure was found
-      - pdf_keyword_score:                effective score of selected page
-      - page_scores:                      per-page scoring detail
-      - confidence_tier:                  2 if subgroups extracted, else 3
-      - source:                           study_name if provided
-      - bbox_found:                       true if figure cluster was detected
-
-    Response (added when extract_subgroups=True):
-      - subgroups:                        list of {name,n,hr,ci_low,ci_high,…}
-                                          or {is_header,category} group separators
-      - subgroups_count:                  number of data rows (excluding headers)
-      - subgroups_dropped_count:          rows Gemini returned but validation rejected
-      - subgroups_extraction_method:      Gemini model id ACTUALLY used (primary or fallback)
-      - subgroups_favours_left/right:     arrow labels read from the plot
-      - subgroups_figure_title:           figure title/caption read from the image
-      - subgroups_error:                  error string if Gemini failed, else None
+    Response:
+      - png_base64:            the 400 DPI PNG crop
+      - figure_crop_base64:    same (for compatibility with KM response shape)
+      - page_number:           1-indexed page where the figure was found
+      - pdf_keyword_score:     the effective score of the selected page
+      - page_scores:           list per page with forest/km_penalty/effective
+      - confidence_tier:       always 3 (original figure, not reconstructed)
+      - source:                study_name if provided
+      - bbox_found:            true if a figure cluster was detected, false
+                               if we fell back to rendering the whole page
     """
     try:
         result = extract_forest_from_pdf(
             pdf_base64=req.pdf_base64,
             study_name=req.study_name,
             min_score=req.min_score,
-            extract_subgroups=req.extract_subgroups,
         )
         return JSONResponse(result)
     except ValueError as ve:
@@ -322,34 +242,9 @@ def forest_plot_endpoint(req: ForestPlotRequest):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/extract-km")
-def extract_km_endpoint(req: ExtractKMRequest):
-    """
-    POST /extract-km — Extract Kaplan-Meier curves from a publication figure.
-
-    Input:  image (base64), optional study_name, optional arm_colors.
-    Output: arm coordinates [[time, survival%], ...], censored times, median,
-            a reconstructed medaccur-style PNG, confidence tier 1-3.
-    """
-    try:
-        arm_colors = (
-            [a.model_dump() for a in req.arm_colors] if req.arm_colors else None
-        )
-        result = extract_km(
-            image_base64=req.image_base64,
-            study_name=req.study_name,
-            arm_colors=arm_colors,
-            x_range=tuple(req.x_range) if req.x_range else None,
-            y_range=tuple(req.y_range) if req.y_range else None,
-            plot_bounds=tuple(req.plot_bounds) if req.plot_bounds else None,
-        )
-        return JSONResponse(result)
-    except ValueError as ve:
-        return JSONResponse({"error": str(ve)}, status_code=400)
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"extract-km error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+# Phase 5: /extract-km endpoint removed — old OpenCV pixel-tracing pipeline
+# replaced by the Vision pipeline in /extract-km-from-pdf. To process a
+# bare image, wrap it in a 1-page PDF first.
 
 
 # ══════════════════════════════════════════════════════════════════

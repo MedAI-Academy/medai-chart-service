@@ -5,6 +5,8 @@ matplotlib>=3.8.0
 Pillow>=10.0.0
 python-pptx>=0.6.23
 lxml>=4.9.0
-opencv-python-headless>=4.8.0
+# opencv-python-headless removed in Phase 5 — the OpenCV pixel-tracing KM
+# pipeline has been replaced by Gemini Vision + NEJM-style renderer.
+# Re-add if another part of the service ever needs cv2.
 PyMuPDF>=1.24.0
 google-generativeai>=0.8.5
