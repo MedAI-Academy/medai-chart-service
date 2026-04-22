@@ -101,6 +101,33 @@ _MODEL_UNAVAILABLE_INDICATORS = (
     "unexpected model name",  # Railway empty-env-var bug, 2026-04-20
 )
 
+# Transient server-side errors — the request failed but the problem is
+# likely temporary (overloaded queue, server-side deadline, upstream hiccup).
+# Policy: retry on SAME model first (might recover on next try), and if the
+# retry also fails, escalate to the fallback model (the second model may be
+# served from different infrastructure with independent load). This is
+# DIFFERENT from _MODEL_UNAVAILABLE_INDICATORS, where the primary model is
+# structurally broken and retry on the same model would just fail again.
+#
+# Added 2026-04-22 after observing "504 Deadline expired" on
+# gemini-3-flash-preview during real-world VIALE-A extraction. The preview
+# model's server queue appeared overloaded; a retry or fallback to
+# gemini-2.5-flash (stable production model) is the correct response.
+_TRANSIENT_SERVER_INDICATORS = (
+    "504",
+    "503",
+    "500",
+    "deadline expired",
+    "deadline exceeded",
+    "server error",
+    "service unavailable",
+    "overloaded",
+    "try again later",
+    "internal error",
+    "timeout",
+    "timed out",
+)
+
 # ─────────────────────────────────────────────────────────────────
 # PROMPT 1 — Metadata extraction
 # ─────────────────────────────────────────────────────────────────
@@ -733,7 +760,24 @@ def _run_pass(genai_module, png_bytes: bytes, prompt: str, label: str, source_hi
                     f"it was renamed/deprecated."
                 )
                 break
-            # Other exceptions (auth, quota, etc.) — same model retry won't help either
+            if _is_transient_server_error(exc):
+                # Transient: server-side deadline / 504 / overloaded. Retry
+                # on the SAME model (might clear), and if we've exhausted
+                # retries, fall through to the fallback model.
+                if attempt < GEMINI_RETRIES_PER_PASS:
+                    logger.warning(
+                        f"KM {label}: transient server error on attempt {attempt+1} "
+                        f"with {GEMINI_PRIMARY_MODEL} ({exc}) — retrying same model"
+                    )
+                    continue
+                logger.warning(
+                    f"KM {label}: transient server error {attempt+1}× on "
+                    f"{GEMINI_PRIMARY_MODEL} ({exc}) — trying fallback model"
+                )
+                break
+            # Other exceptions (auth, quota, malformed response, etc.) —
+            # retrying the same model won't help, and the fallback model
+            # would hit the same auth/quota issue. Return early.
             logger.warning(
                 f"KM {label}: failed on {GEMINI_PRIMARY_MODEL} "
                 f"(no retry — not a transient error): {exc}"
@@ -767,6 +811,15 @@ def _run_pass(genai_module, png_bytes: bytes, prompt: str, label: str, source_hi
             break
         except Exception as exc:
             fallback_exc = exc
+            if _is_transient_server_error(exc) and attempt < GEMINI_RETRIES_PER_PASS:
+                # Fallback model also hit a transient issue. One retry
+                # before giving up — two transient errors in a row on a
+                # production model is rare but worth the cost.
+                logger.warning(
+                    f"KM {label}: transient server error on attempt {attempt+1} "
+                    f"with fallback {GEMINI_FALLBACK_MODEL} ({exc}) — retrying"
+                )
+                continue
             break
 
     logger.error(
@@ -864,6 +917,23 @@ def _is_model_unavailable_error(exc: Exception) -> bool:
     would just fail again on the fallback model."""
     msg = str(exc).lower()
     return any(indicator in msg for indicator in _MODEL_UNAVAILABLE_INDICATORS)
+
+
+def _is_transient_server_error(exc: Exception) -> bool:
+    """Detect transient server-side errors (504, 503, overloaded queues,
+    server-side timeout) that should trigger retry-then-fallback.
+
+    Different from _is_model_unavailable_error: the model itself is fine,
+    but this specific request hit infrastructure trouble. Retrying may
+    succeed; if it doesn't, the fallback model (likely on different
+    infrastructure) is our best recovery path.
+
+    Critical distinction: we check for transient BEFORE model-unavailable
+    in the call site, because a 504 response might coincidentally match
+    less-specific indicators. Keeping the two sets conceptually separate
+    makes the logic easier to reason about."""
+    msg = str(exc).lower()
+    return any(indicator in msg for indicator in _TRANSIENT_SERVER_INDICATORS)
 
 
 def _validate_arms(raw_arms) -> tuple[list, list]:
