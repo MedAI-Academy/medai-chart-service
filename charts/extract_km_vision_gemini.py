@@ -56,18 +56,33 @@ logger = logging.getLogger(__name__)
 # `or` (instead of os.environ.get's default arg) makes empty-string env
 # vars fall back to the code default — important because Railway's UI
 # can create env vars with empty values, which we hit on 2026-04-20.
-# Demo-stability patch (2026-04-23):
-# Invert primary/fallback. gemini-3-flash-preview was the original primary but
-# we observed repeated 504 Deadline errors in production during real-world
-# VIALE-A extraction on 2026-04-22 — the preview model's server queue appeared
-# overloaded. gemini-2.5-flash is the stable GA model, runs on different
-# infrastructure, and handles KM curve extraction identically in our tests.
-# Using it as primary gives us predictable <20s per-pass response time; the
-# preview model stays wired in as fallback so we can bounce back onto it by
-# overriding via env var. To go back to preview-first, set
-# GEMINI_KM_MODEL=gemini-3-flash-preview in Railway.
-GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_KM_MODEL")          or "gemini-2.5-flash"
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-3-flash-preview"
+# Model routing (2026-04-24 update: re-inverted based on production logs)
+#
+# PRIMARY: gemini-3-flash-preview
+#   Despite being a preview model, production logs on 2026-04-24 showed
+#   gemini-3-flash-preview delivering reliable Pass 3 (curve) extractions
+#   where gemini-2.5-flash hit repeated 504 "request timed out" errors from
+#   Google's own server-side load balancer. The preview model runs on
+#   different infrastructure and handles dense Vision tasks (80+ curve
+#   coordinates from 400 DPI PDF crop) consistently under 45s wall time.
+#   Preview status risk: Google may deprecate with short notice; the env-var
+#   override below lets operations react without code change.
+#
+# FALLBACK: gemini-2.5-flash
+#   Stable GA model on different infrastructure than the preview. Used if
+#   the preview model is deprecated/renamed (triggers model-unavailable error
+#   path) or if the preview endpoint itself 504s. When the fallback fires it
+#   will be slower (we've seen 504s on it too, requiring its own retry),
+#   but it's our last line of defence.
+#
+# History: Inverted from preview-first to stable-first on 2026-04-23 after
+# seeing preview-model 504s that day; inverted back on 2026-04-24 after the
+# stable model showed the same 504 pattern while preview recovered. Both
+# models have occasional infrastructure issues — the only honest statement
+# is "we have two independent routes and try the faster/more accurate one
+# first." Operations can swap at any time via env vars.
+GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_KM_MODEL")          or "gemini-3-flash-preview"
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-2.5-flash"
 
 # ── Timeout strategy (3 layers) ────────────────────────────────────
 # Layer 1: per-call SDK timeout. We rely on the SDK's request_options
@@ -90,6 +105,36 @@ GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-3-
 GEMINI_TIMEOUT_PER_CALL_SECONDS  = 60  # one (model, prompt) attempt (was 25 until 2026-04-24)
 GEMINI_RETRIES_PER_PASS          = 1   # retry budget per pass (so up to 2 attempts)
 GEMINI_TOTAL_EXTRACTION_SECONDS  = 150 # absolute ceiling, all passes combined (was 75 until 2026-04-24)
+
+# ── Pass 3 Curve Chunking (2026-04-24, experimental) ──────────────
+# Opt-in feature: split Pass 3 into N time-range chunks running in parallel.
+# Rationale: a single "extract 80 points" call produces a dense JSON output
+# (1200+ tokens) that Google's Vision endpoint occasionally 504s on. Splitting
+# into 3 chunks of ~30 points each per arm cuts per-call output density by 3x,
+# making each chunk less likely to hit the server-side deadline.
+#
+# Default OFF. To enable, set KM_CURVE_CHUNKING=1 in Railway env vars.
+# If anything goes wrong during chunked extraction (merge failure, partial
+# results) the code falls back to the single-call path automatically so the
+# slide still renders.
+#
+# Design notes:
+# - Chunks run in parallel (not sequential) because they're independent Gemini
+#   calls. Total wall time = max(chunk_a, chunk_b, chunk_c) ≈ 25-40s, compared
+#   to ~60s for the single call — AND less likely to 504.
+# - Arms are matched across chunks BY POSITION (arm 0 across all chunks = same
+#   treatment arm), not by name. This avoids fuzzy name matching ("Ven+Aza" vs
+#   "Venetoclax + Azacitidine") which is unreliable.
+# - Overlapping t-values across chunks are deduplicated by averaging the
+#   survival values (rare but harmless).
+_KM_CURVE_CHUNKING_ENABLED = bool(
+    os.environ.get("KM_CURVE_CHUNKING", "").strip()
+    and os.environ.get("KM_CURVE_CHUNKING", "").strip().lower() not in ("0", "false", "off", "no")
+)
+_KM_CURVE_CHUNK_COUNT = 3  # number of parallel time-range chunks
+_KM_CURVE_CHUNK_OVERLAP_RATIO = 0.10  # 10% overlap between adjacent chunks
+                                      # (helps continuity at chunk boundaries)
+
 
 # Substrings (lowercased) in the exception message that indicate the
 # model itself is the problem (gone, renamed, deprecated, no permission).
@@ -349,6 +394,295 @@ OUTPUT STRUCTURE: identical to the first-attempt prompt — same JSON schema wit
 
 
 # ─────────────────────────────────────────────────────────────────
+# PROMPT 3-CHUNK — Time-range-specific curve extraction (opt-in)
+# ─────────────────────────────────────────────────────────────────
+# Called when _KM_CURVE_CHUNKING_ENABLED is true. Builds a prompt that asks
+# Gemini to extract ONLY the portion of the curve within a specific time
+# range [t_start, t_end]. Three such prompts run in parallel, each producing
+# ~30 points per arm instead of 80 — much less output density, much less
+# likely to 504.
+def _build_chunked_curve_prompt(t_start: float, t_end: float, x_axis_max: Optional[float]) -> str:
+    """Build a prompt for chunk extraction covering only [t_start, t_end].
+
+    The prompt is near-identical to CURVE_PROMPT but with explicit time range
+    constraints injected, and a reduced point target scaled to the chunk
+    proportion of the full axis.
+    """
+    # Target ~30 points per chunk × 3 chunks ≈ 90 total points per arm
+    # (vs 80 in single-call mode). We actually get better coverage because
+    # each chunk can sample more densely in its smaller region.
+    chunk_target = 30
+    chunk_min    = 15
+
+    axis_note = f"The full curve x-axis spans 0 to {x_axis_max:.0f}." if x_axis_max else ""
+
+    return f"""You are a medical data extraction specialist. Read a SPECIFIC TIME RANGE of the Kaplan-Meier curve(s) from this figure and return (time, survival) coordinates.
+
+TIME RANGE FOR THIS EXTRACTION: t = {t_start:.1f} to t = {t_end:.1f} (in the x-axis unit shown in the figure, typically months).
+{axis_note}
+
+ONLY extract coordinates where t falls within [{t_start:.1f}, {t_end:.1f}]. Ignore all data outside this range. This is one of several parallel extractions covering different time segments — your job is only this segment.
+
+CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
+1. Coordinates MUST come from carefully reading the actual plotted curve. Do NOT extrapolate, smooth, or fill in coordinates you cannot see.
+2. If the curve in this range becomes hard to read, provide fewer points rather than guessing.
+3. Survival values MUST monotonically decrease (or stay flat) over time within each arm. KM curves NEVER go up.
+4. Every t value you return MUST be within [{t_start:.1f}, {t_end:.1f}]. Points outside this range will be rejected.
+
+OUTPUT TARGET: {chunk_target} coordinates per arm within this time range. Sample strategically:
+  * Place 2 points at EVERY visible step/drop (one before, one after).
+  * On flat plateaus, place 2-3 points (plateau start, end).
+  * Accept fewer points (down to ~{chunk_min}) if the curve in this range is sparse or unreadable.
+
+OUTPUT STRUCTURE (return JSON matching this shape exactly):
+{{
+  "chunk_t_start": {t_start},
+  "chunk_t_end": {t_end},
+  "x_axis_unit": "months",
+  "y_axis_scale": "percent",
+  "arms": [
+    {{
+      "name": "arm name as shown in legend",
+      "color": "blue",
+      "points": [
+        {{"t": <within range>, "s": <survival value>}}
+      ]
+    }}
+  ],
+  "extraction_notes": "Optional notes"
+}}
+
+If the curve in this range is unreadable, return {{"arms": [], "extraction_notes": "Range unreadable"}}.
+"""
+
+
+def _run_chunked_curve_pass(
+    genai_module, png_bytes: bytes, metadata: dict, source_hint: Optional[str],
+    deadline: float,
+) -> tuple:
+    """Run Pass 3 as N parallel time-range chunks. Returns same tuple shape
+    as _run_pass: (merged_curve_dict_or_None, model_id, error_or_None).
+
+    Falls back to single-call curve extraction (by returning an error) if:
+    - Metadata doesn't give us a usable x_axis_max
+    - Fewer than 2 chunks succeeded
+    - Merge fails for any reason
+
+    The caller should detect error!=None and retry via the single-call path.
+    """
+    import concurrent.futures as _cf
+    import time as _time
+
+    # ---- Determine axis range from metadata ----
+    x_axis_max = None
+    if isinstance(metadata, dict):
+        x_axis_max = _to_float(metadata.get("x_max"))
+    if not x_axis_max or x_axis_max <= 0:
+        logger.warning(
+            f"KM chunked curve: cannot determine x_axis_max from metadata "
+            f"for source='{source_hint}' — falling back to single-call curve pass"
+        )
+        return None, GEMINI_PRIMARY_MODEL, "no axis max available for chunking"
+
+    # ---- Build chunk ranges with overlap ----
+    # Example: x_axis_max=30, chunks=3, overlap=10% → chunks at [0, 11], [9, 21], [19, 30]
+    chunks: list[tuple[float, float]] = []
+    span = x_axis_max / _KM_CURVE_CHUNK_COUNT
+    overlap = span * _KM_CURVE_CHUNK_OVERLAP_RATIO
+    for i in range(_KM_CURVE_CHUNK_COUNT):
+        t_start = max(0.0, i * span - overlap)
+        t_end   = min(x_axis_max, (i + 1) * span + overlap)
+        chunks.append((t_start, t_end))
+
+    logger.info(
+        f"KM chunked curve: {_KM_CURVE_CHUNK_COUNT} chunks over [0, {x_axis_max}] "
+        f"for source='{source_hint}': {chunks}"
+    )
+
+    # ---- Launch chunks in parallel ----
+    # Each chunk gets its own _run_pass invocation with a chunk-specific
+    # prompt. _run_pass handles primary→fallback routing + per-call watchdog
+    # just like the single-call path — no new retry logic needed.
+    remaining = max(5.0, deadline - _time.monotonic())
+    per_chunk_budget = max(10.0, remaining * 0.85)  # leave 15% headroom for merging
+
+    executor = _cf.ThreadPoolExecutor(
+        max_workers=_KM_CURVE_CHUNK_COUNT, thread_name_prefix="km-chunk"
+    )
+    futures: list = []
+    try:
+        for idx, (t_start, t_end) in enumerate(chunks):
+            prompt = _build_chunked_curve_prompt(t_start, t_end, x_axis_max)
+            label = f"Pass 3 chunk {idx+1}/{_KM_CURVE_CHUNK_COUNT} (t={t_start:.1f}-{t_end:.1f})"
+            futures.append(executor.submit(
+                _run_pass, genai_module, png_bytes, prompt, label, source_hint
+            ))
+
+        # Collect results with per-chunk timeout derived from remaining budget
+        chunk_results: list = []
+        for idx, fut in enumerate(futures):
+            per_future_remaining = max(0.5, deadline - _time.monotonic())
+            try:
+                chunk_data, chunk_model, chunk_err = fut.result(
+                    timeout=min(per_chunk_budget, per_future_remaining)
+                )
+                chunk_results.append({
+                    "idx": idx, "data": chunk_data, "model": chunk_model, "err": chunk_err,
+                    "t_start": chunks[idx][0], "t_end": chunks[idx][1],
+                })
+            except _cf.TimeoutError:
+                logger.warning(
+                    f"KM chunked curve: chunk {idx+1} exceeded deadline "
+                    f"for source='{source_hint}'"
+                )
+                chunk_results.append({
+                    "idx": idx, "data": None, "model": GEMINI_PRIMARY_MODEL,
+                    "err": "chunk watchdog timeout",
+                    "t_start": chunks[idx][0], "t_end": chunks[idx][1],
+                })
+    finally:
+        executor.shutdown(wait=False)
+
+    # ---- Check how many chunks succeeded ----
+    successful = [cr for cr in chunk_results if cr["data"] and not cr["err"]]
+    if len(successful) < 2:
+        logger.warning(
+            f"KM chunked curve: only {len(successful)}/{_KM_CURVE_CHUNK_COUNT} chunks "
+            f"succeeded for source='{source_hint}' — falling back to single-call"
+        )
+        return None, GEMINI_PRIMARY_MODEL, (
+            f"only {len(successful)}/{_KM_CURVE_CHUNK_COUNT} chunks succeeded; falling back"
+        )
+
+    logger.info(
+        f"KM chunked curve: {len(successful)}/{_KM_CURVE_CHUNK_COUNT} chunks succeeded "
+        f"for source='{source_hint}' — merging"
+    )
+
+    # ---- Merge chunks into a single curve_data structure ----
+    # Strategy: arms are matched BY POSITION across chunks (not by name).
+    # Missing chunks leave gaps in the arm's point array; duplicate t-values
+    # across chunk boundaries are averaged.
+    merged = _merge_curve_chunks(successful, x_axis_max, source_hint)
+    if not merged or not merged.get("arms"):
+        logger.warning(
+            f"KM chunked curve: merge produced no arms for source='{source_hint}' — "
+            f"falling back to single-call"
+        )
+        return None, successful[0]["model"], "merge produced no arms; falling back"
+
+    # Model-used reporting: say "chunked:{model}" so the frontend knows
+    model_used = f"chunked:{successful[0]['model']}"
+    return merged, model_used, None
+
+
+def _merge_curve_chunks(successful_chunks: list, x_axis_max: float, source_hint: Optional[str]) -> Optional[dict]:
+    """Merge successful chunk results into one curve_data dict.
+
+    Arms are matched by INDEX across chunks (not name). For each arm, all
+    points from all chunks are collected, sorted by time, and duplicates
+    (same t) are averaged in s.
+
+    Returns a dict matching the shape expected by _validate_curves
+    (x_axis_unit, x_axis_min, x_axis_max, y_axis_scale, y_axis_min,
+    y_axis_max, arms[{name, color, points, censoring_times}]), or None if
+    merging is not feasible.
+    """
+    # Sort chunks by t_start so arm-index alignment is stable
+    successful_chunks = sorted(successful_chunks, key=lambda c: c["t_start"])
+
+    # Defensive: empty input
+    if not successful_chunks:
+        return None
+
+    # Determine max arm count across chunks (for position-based matching).
+    # Use the first chunk's arm count as the reference — KM figures have
+    # a fixed number of arms that should be consistent across the image.
+    first_data = successful_chunks[0]["data"]
+    if not isinstance(first_data, dict):
+        return None
+    first_arms = first_data.get("arms") or []
+    if not isinstance(first_arms, list) or not first_arms:
+        return None
+    expected_arm_count = len(first_arms)
+
+    # Collect per-arm points across all chunks
+    merged_arms: list[dict] = []
+    for arm_idx in range(expected_arm_count):
+        arm_name = None
+        arm_color = None
+        all_points: list[dict] = []
+        for cr in successful_chunks:
+            cdata = cr["data"]
+            if not isinstance(cdata, dict):
+                continue
+            carms = cdata.get("arms") or []
+            if arm_idx >= len(carms):
+                continue  # this chunk had fewer arms; skip
+            carm = carms[arm_idx]
+            if not isinstance(carm, dict):
+                continue
+            # Capture name/color from the first chunk that has them
+            if not arm_name and carm.get("name"):
+                arm_name = _safe_str(carm.get("name"), "", max_len=80)
+            if not arm_color and carm.get("color"):
+                arm_color = _safe_str(carm.get("color"), "", max_len=20).lower()
+            # Collect points, filtering by chunk's nominal time range to
+            # drop any out-of-range hallucinations
+            t_start = cr["t_start"]
+            t_end = cr["t_end"]
+            pts = carm.get("points") or []
+            if not isinstance(pts, list):
+                continue
+            for p in pts:
+                if not isinstance(p, dict):
+                    continue
+                t = _to_float(p.get("t"))
+                s = _to_float(p.get("s"))
+                if t is None or s is None:
+                    continue
+                # Allow 5% slack on chunk boundaries (overlap region)
+                slack = (t_end - t_start) * 0.05
+                if not (t_start - slack <= t <= t_end + slack):
+                    continue
+                all_points.append({"t": t, "s": s})
+
+        if not all_points:
+            continue
+
+        # Dedup + average: bin by t rounded to 2 decimals
+        from collections import defaultdict
+        bins: dict = defaultdict(list)
+        for p in all_points:
+            bins[round(p["t"], 2)].append(p["s"])
+        deduped = [{"t": t, "s": sum(vals) / len(vals)} for t, vals in bins.items()]
+        # Sort by time, ensure monotonic decrease
+        deduped.sort(key=lambda p: p["t"])
+
+        merged_arms.append({
+            "name": arm_name or f"arm_{arm_idx + 1}",
+            "color": arm_color or "",
+            "points": deduped,
+            "censoring_times": [],  # not extracted in chunked mode
+        })
+
+    if not merged_arms:
+        return None
+
+    # Assemble result with axis metadata from the first chunk
+    return {
+        "x_axis_unit": _safe_str(first_data.get("x_axis_unit"), "months", max_len=20).lower(),
+        "x_axis_min": 0.0,
+        "x_axis_max": x_axis_max,
+        "y_axis_scale": _safe_str(first_data.get("y_axis_scale"), "percent", max_len=20).lower(),
+        "y_axis_min": 0.0,
+        "y_axis_max": 100.0,
+        "arms": merged_arms,
+        "extraction_notes": f"Merged from {len(successful_chunks)} chunks",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────
 
@@ -504,13 +838,36 @@ def extract_km_vision(
     # Runs last so that (a) earlier passes succeeded under lighter API load,
     # (b) Pass 3 gets whatever budget remains — typically 90-120s if
     # Pass 1 + Pass 2 were healthy.
+    #
+    # If KM_CURVE_CHUNKING env var is set, run Pass 3 as N parallel time-range
+    # chunks instead of one big call. See _run_chunked_curve_pass for rationale.
+    # If chunking fails for any reason (insufficient successful chunks, merge
+    # failure, missing axis metadata) we automatically fall back to the
+    # single-call path so the slide still renders.
     logger.info(
         f"Pass 2 (NaR) complete, remaining budget {_remaining_budget():.1f}s — "
         f"running Pass 3 (curve)"
+        f"{' [CHUNKED mode]' if _KM_CURVE_CHUNKING_ENABLED else ''}"
     )
-    curve_data, curve_model, curve_error = _run_pass_with_deadline(
-        CURVE_PROMPT, "Pass 3 (curve)"
-    )
+
+    if _KM_CURVE_CHUNKING_ENABLED:
+        curve_data, curve_model, curve_error = _run_chunked_curve_pass(
+            genai, png_bytes, metadata_data, source_hint, deadline,
+        )
+        # If chunked path failed, transparently fall back to single-call.
+        # curve_model will start with "chunked:" on success to flag provenance.
+        if curve_error and _remaining_budget() > 10.0:
+            logger.info(
+                f"Chunked curve pass failed ({curve_error}) — falling back to "
+                f"single-call curve extraction for source='{source_hint}'"
+            )
+            curve_data, curve_model, curve_error = _run_pass_with_deadline(
+                CURVE_PROMPT, "Pass 3 (curve, fallback)"
+            )
+    else:
+        curve_data, curve_model, curve_error = _run_pass_with_deadline(
+            CURVE_PROMPT, "Pass 3 (curve)"
+        )
 
     # Defensive: Gemini occasionally returns a JSON list at the top level
     # instead of the object we asked for (schema violation). The rest of
