@@ -59,7 +59,10 @@ _HR_AXIS_MAX = 10.0
 # Row heights
 _ROW_H = 0.32            # inches per row — compact NEJM-style
 _HEADER_MARGIN = 0.95    # inches for title + column headers at top
-_FOOTER_MARGIN = 1.25    # inches for axis + favours + reconstructed-from
+_FOOTER_MARGIN = 1.55    # inches for axis + favours + reconstructed-from
+                         # (raised from 1.25 on 2026-04-24 to prevent overlap
+                         # between "Hazard Ratio" axis title and favours labels
+                         # after bumping their font sizes to 11pt)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────
@@ -134,10 +137,12 @@ def render_forest_nejm(
 
     # Dynamic figure height: rows × row-height + fixed margins
     fig_height = max(5.5, _HEADER_MARGIN + n_rows * _ROW_H + _FOOTER_MARGIN)
-    # Width reduced 2026-04-24 from 12.0 to 9.0 — empty space was stretched
-    # horizontally in the PPTX layout (Forest slide aspect ratio). 9.0 gives
-    # a more compact, publication-standard feel.
-    fig_width = 9.0
+    # Width tuned 2026-04-24 to 10.0 (from 12.0 original, then 9.0 intermediate).
+    # The PPTX slide embeds this figure at a fixed box width that may stretch
+    # horizontally if the plot aspect ratio doesn't match; 10.0 × dynamic-height
+    # is closer to the slide-box aspect than 12.0 was. Combined with the font-size
+    # bumps below, this should keep text readable when embedded in a 16:9 slide.
+    fig_width = 10.0
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     fig.patch.set_facecolor("white")
@@ -160,13 +165,13 @@ def render_forest_nejm(
     if title:
         fig.text(
             0.04, 1.0 - 0.22 / fig_height, title,
-            fontsize=13, fontweight="bold", color=_COLOR_HEADER,
+            fontsize=15, fontweight="bold", color=_COLOR_HEADER,
             ha="left", va="top",
         )
     if subtitle:
         fig.text(
             0.04, 1.0 - 0.52 / fig_height, subtitle,
-            fontsize=9.5, color=_COLOR_MUTED,
+            fontsize=11, color=_COLOR_MUTED,
             ha="left", va="top", fontstyle="italic",
         )
 
@@ -182,13 +187,13 @@ def render_forest_nejm(
 
     # Column headers
     ax_table.text(0.01, -0.85, "Subgroup",
-                  fontsize=9.5, fontweight="bold", color=_COLOR_HEADER,
+                  fontsize=11, fontweight="bold", color=_COLOR_HEADER,
                   ha="left", va="center")
-    ax_table.text(0.74, -0.85, "N",
-                  fontsize=9.5, fontweight="bold", color=_COLOR_HEADER,
+    ax_table.text(0.60, -0.85, "N",
+                  fontsize=11, fontweight="bold", color=_COLOR_HEADER,
                   ha="center", va="center")
     ax_table.text(0.99, -0.85, "HR (95% CI)",
-                  fontsize=9.5, fontweight="bold", color=_COLOR_HEADER,
+                  fontsize=11, fontweight="bold", color=_COLOR_HEADER,
                   ha="right", va="center")
     # separator line
     ax_table.plot([0.0, 1.0], [-0.5, -0.5],
@@ -233,7 +238,7 @@ def render_forest_nejm(
         if row["type"] == "header":
             ax_table.text(
                 0.01, y, row["label"],
-                fontsize=9.5, fontweight="bold", color=_COLOR_HEADER,
+                fontsize=11, fontweight="bold", color=_COLOR_HEADER,
                 ha="left", va="center",
             )
             continue
@@ -241,16 +246,16 @@ def render_forest_nejm(
         indent = "" if row["type"] == "overall" else "   "
         label_weight = "bold" if row["type"] == "overall" else "normal"
         label_color = _COLOR_HEADER if row["type"] == "overall" else _COLOR_TEXT
-        label_size = 9.0
+        label_size = 10.5
 
         ax_table.text(0.01, y, indent + row["label"],
                       fontsize=label_size, fontweight=label_weight,
                       color=label_color, ha="left", va="center")
-        ax_table.text(0.74, y, row["n"],
-                      fontsize=8.5, color=label_color,
+        ax_table.text(0.60, y, row["n"],
+                      fontsize=10, color=label_color,
                       ha="center", va="center")
         ax_table.text(0.99, y, row["hr_text"],
-                      fontsize=8.5, fontweight=label_weight,
+                      fontsize=10, fontweight=label_weight,
                       color=label_color,
                       ha="right", va="center")
 
@@ -300,7 +305,7 @@ def render_forest_nejm(
 
     ax_plot.set_xlabel(
         "Hazard Ratio (95% CI, log scale)",
-        fontsize=9, color=_COLOR_HEADER, labelpad=5, fontweight="bold",
+        fontsize=11, color=_COLOR_HEADER, labelpad=5, fontweight="bold",
     )
 
     # ── "Favours" arrows + labels under the axis ──────────────────────
@@ -324,10 +329,10 @@ def render_forest_nejm(
         mutation_scale=10, transform=fig.transFigure,
     ))
     fig.text(plot_left_mid, text_y, favours_left,
-             fontsize=9, fontweight="bold", color=_COLOR_HEADER,
+             fontsize=11, fontweight="bold", color=_COLOR_HEADER,
              ha="center", va="top")
     fig.text(plot_right_mid, text_y, favours_right,
-             fontsize=9, fontweight="bold", color=_COLOR_HEADER,
+             fontsize=11, fontweight="bold", color=_COLOR_HEADER,
              ha="center", va="top")
 
     # ── "Reconstructed from …" liability footer — bottom edge, its own line ─
