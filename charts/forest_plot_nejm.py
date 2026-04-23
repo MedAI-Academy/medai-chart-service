@@ -134,7 +134,10 @@ def render_forest_nejm(
 
     # Dynamic figure height: rows × row-height + fixed margins
     fig_height = max(5.5, _HEADER_MARGIN + n_rows * _ROW_H + _FOOTER_MARGIN)
-    fig_width = 12.0
+    # Width reduced 2026-04-24 from 12.0 to 9.0 — empty space was stretched
+    # horizontally in the PPTX layout (Forest slide aspect ratio). 9.0 gives
+    # a more compact, publication-standard feel.
+    fig_width = 9.0
 
     fig = plt.figure(figsize=(fig_width, fig_height), dpi=dpi)
     fig.patch.set_facecolor("white")

@@ -250,15 +250,18 @@ If there is NO Number-at-Risk table visible in this image (some KM figures don't
 # ─────────────────────────────────────────────────────────────────
 # PROMPT 3 — Curve coordinates (the visual KM line itself)
 # ─────────────────────────────────────────────────────────────────
-# This is the most accuracy-sensitive pass. We need ~100 (time, survival)
-# coordinates per arm so the renderer can produce a visually faithful
-# reconstruction. The prompt:
-#   - asks for DENSE sampling, especially around drops
+# This is the most accuracy-sensitive pass. We need ~50 (time, survival)
+# coordinates per arm — ENOUGH to preserve the step-function character
+# (plateaus, steep drops, inflection points) but not so many that Gemini
+# times out on the curve pass (reduced 2026-04-24 from 100 after observing
+# repeated 504 timeouts at 100 points; 50 is the sweet spot for pragmatic
+# throughput while still capturing KM shape accurately).
+# The prompt:
+#   - asks for SHAPE-PRESERVING sampling, not uniform sampling
 #   - explicitly requires monotonic decrease per arm
 #   - asks for axis range hints to anchor the coordinate space
-#   - allows partial output if the model can't reach 100 confidently
-#     (we accept ≥70 in validation, more is better)
-CURVE_PROMPT = """You are a medical data extraction specialist. Read the Kaplan-Meier curve(s) from this figure and return dense (time, survival) coordinates that trace each curve as accurately as possible.
+#   - allows partial output if the model can't reach 50 confidently
+CURVE_PROMPT = """You are a medical data extraction specialist. Read the Kaplan-Meier curve(s) from this figure and return (time, survival) coordinates that faithfully capture the STEP-FUNCTION character of each curve.
 
 CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
 1. Coordinates MUST come from carefully reading the actual plotted curve. Do NOT extrapolate, smooth, or fill in coordinates you cannot see.
@@ -266,7 +269,13 @@ CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
 3. Survival values MUST monotonically decrease (or stay flat) over time within each arm. KM curves NEVER go up. If you misread a point, OMIT it rather than recording an upward step.
 4. Coordinates must respect the axis ranges shown in the figure. A point at (40 months, 95%) on a plot with x_max=30 is impossible — re-check.
 
-OUTPUT TARGET: 100 coordinates per arm, evenly distributed along the visible curve. Sample MORE densely where the curve drops steeply, LESS densely on flat plateaus. We accept fewer points (down to ~70) if some sections are genuinely unreadable, but try to reach 100.
+OUTPUT TARGET: 50 coordinates per arm. CRITICAL — sample STRATEGICALLY, not uniformly:
+  * Place 2 points at EVERY visible step/drop: one just BEFORE the drop (top of the step) and one just AFTER (bottom of the step). This preserves the step character.
+  * On flat plateaus, place only 2-3 points (start and end of the plateau) — no need for dense sampling where nothing changes.
+  * Concentrate MORE density around steep descent zones (where many events cluster).
+  * This means: 50 points placed at MEANINGFUL locations is FAR better than 50 evenly-spaced points. A uniform sampling would average out the steps and destroy the KM shape.
+
+Accept fewer points (down to ~30) if some sections are genuinely unreadable, but try to reach 50.
 
 OUTPUT STRUCTURE (return JSON matching this shape exactly):
 {
@@ -336,7 +345,7 @@ CRITICAL ANTI-HALLUCINATION RULES (non-negotiable):
 EXTRACTION FOCUS:
 - Sample densely around the median crossing zone for each arm (where curve approaches and crosses 50%).
 - Use the anchors above as a sanity check — if your reading puts the median far from the published value, look again at the curve before that region.
-- Target 120 coordinates per arm in this retry (was 100 in the first attempt). Accept ≥80 if some sections are unreadable.
+- Target 60 coordinates per arm in this retry (was 50 in the first attempt). Accept ≥40 if some sections are unreadable. Prioritize shape preservation (step character) over point density.
 
 OUTPUT STRUCTURE: identical to the first-attempt prompt — same JSON schema with x_axis_unit, x_axis_min/max, y_axis_scale, y_axis_min/max, arms[]{{name, color, points[]{{t, s}}, censoring_times}}, extraction_notes.
 """
@@ -1141,8 +1150,13 @@ def _validate_nar(raw_nar, arm_count_hint: int) -> tuple[dict, list]:
 # ─────────────────────────────────────────────────────────────────
 
 # Per-arm point count thresholds. Below MIN_USABLE the arm is dropped.
-CURVE_MIN_USABLE_POINTS_PER_ARM = 70
-CURVE_TARGET_POINTS_PER_ARM     = 100
+# Values reduced 2026-04-24 from 70/100 to 30/50 after observing repeated
+# 504 timeouts on Pass 3 (curve) with 100-point target. 50 points placed
+# strategically (at every step + plateau boundary) preserves KM shape
+# faithfully; the renderer interpolates linearly between them (never
+# smooths), so the step-function character is retained.
+CURVE_MIN_USABLE_POINTS_PER_ARM = 30
+CURVE_TARGET_POINTS_PER_ARM     = 50
 
 # Median-match validation thresholds (relative tolerance vs published value)
 MEDIAN_MATCH_TOLERANCE       = 0.10   # ±10% → MATCH
