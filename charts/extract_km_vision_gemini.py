@@ -56,8 +56,18 @@ logger = logging.getLogger(__name__)
 # `or` (instead of os.environ.get's default arg) makes empty-string env
 # vars fall back to the code default — important because Railway's UI
 # can create env vars with empty values, which we hit on 2026-04-20.
-GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_KM_MODEL")          or "gemini-3-flash-preview"
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-2.5-flash"
+# Demo-stability patch (2026-04-23):
+# Invert primary/fallback. gemini-3-flash-preview was the original primary but
+# we observed repeated 504 Deadline errors in production during real-world
+# VIALE-A extraction on 2026-04-22 — the preview model's server queue appeared
+# overloaded. gemini-2.5-flash is the stable GA model, runs on different
+# infrastructure, and handles KM curve extraction identically in our tests.
+# Using it as primary gives us predictable <20s per-pass response time; the
+# preview model stays wired in as fallback so we can bounce back onto it by
+# overriding via env var. To go back to preview-first, set
+# GEMINI_KM_MODEL=gemini-3-flash-preview in Railway.
+GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_KM_MODEL")          or "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-3-flash-preview"
 
 # ── Timeout strategy (3 layers) ────────────────────────────────────
 # Layer 1: per-call SDK timeout. We rely on the SDK's request_options

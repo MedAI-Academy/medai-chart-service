@@ -66,8 +66,17 @@ logger = logging.getLogger(__name__)
 #   1. env var not set at all
 #   2. env var set to empty string (e.g. operator created the Railway var
 #      with an empty value field) ← we hit this 2026-04-20, hence the `or`
-GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_FOREST_MODEL")          or "gemini-3-flash-preview"
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FOREST_FALLBACK_MODEL") or "gemini-2.5-flash"
+# Demo-stability patch (2026-04-23):
+# Invert primary/fallback. gemini-3-flash-preview was the original primary but
+# we observed repeated 504 Deadline errors in production (VIALE-A test runs on
+# 2026-04-22). gemini-2.5-flash is the stable GA model and handles text-heavy
+# forest plot OCR identically in our tests. Using the stable model as primary
+# gives us predictable <10s response time; the preview model stays wired in
+# as fallback so that when its infrastructure is healthy we can still use it
+# by overriding via env var. To go back to preview-first, set
+# GEMINI_FOREST_MODEL=gemini-3-flash-preview in Railway.
+GEMINI_PRIMARY_MODEL  = os.environ.get("GEMINI_FOREST_MODEL")          or "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FOREST_FALLBACK_MODEL") or "gemini-3-flash-preview"
 GEMINI_TIMEOUT_SECONDS = 60
 
 # Substrings (lowercased) in the exception message that mean "this model
