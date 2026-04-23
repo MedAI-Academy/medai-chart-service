@@ -80,18 +80,16 @@ GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_KM_FALLBACK_MODEL") or "gemini-3-
 #          edge-cases where the SDK hangs in C-level code that timeout=
 #          can't interrupt.
 #
-# Why 25s per call? Phase 4D forest extraction took 5-15s in production.
-# KM is a denser image but similar size. 25s gives 2x headroom over the
-# observed median while keeping total well below Railway's edge timeout
-# (which is typically 30s for Hobby/Pro tier, longer for Enterprise).
-#
-# Why ONE retry only? The retry attacks the same model that just timed
-# out. If it failed at 25s once, the retry usually fails too (rate limit
-# or model overload), but sometimes recovers (transient network blip).
-# Two retries would push worst-case past the budget.
-GEMINI_TIMEOUT_PER_CALL_SECONDS  = 25  # one (model, prompt) attempt
+# 2026-04-24 update: bumped per-call timeout from 25s → 60s after observing
+# repeated 504s on Pass 3 (curve) even at 50-point target. Google's Vision
+# API is slow for dense-image extraction; 25s was too aggressive. Total
+# watchdog proportionally raised to 150s to accommodate a full retry cycle
+# on the primary model (60s × 2 attempts = 120s, plus ~30s headroom).
+# The three passes still run in PARALLEL, so real-world wall time is
+# max(pass1, pass2, pass3), typically 45-70s when healthy — not 150s.
+GEMINI_TIMEOUT_PER_CALL_SECONDS  = 60  # one (model, prompt) attempt (was 25 until 2026-04-24)
 GEMINI_RETRIES_PER_PASS          = 1   # retry budget per pass (so up to 2 attempts)
-GEMINI_TOTAL_EXTRACTION_SECONDS  = 75  # absolute ceiling, both passes combined
+GEMINI_TOTAL_EXTRACTION_SECONDS  = 150 # absolute ceiling, all passes combined (was 75 until 2026-04-24)
 
 # Substrings (lowercased) in the exception message that indicate the
 # model itself is the problem (gone, renamed, deprecated, no permission).
@@ -421,85 +419,99 @@ def extract_km_vision(
     )
 
     # ──────────────────────────────────────────────────────────────
-    # Run BOTH passes in parallel via ThreadPoolExecutor.
+    # Run passes SEQUENTIALLY (2026-04-24 refactor from parallel).
     #
-    # Why threads (not asyncio)?
-    #   - Gemini calls are I/O-bound (HTTPS request, server compute, response).
-    #     Threads release the GIL during socket I/O so true parallelism works.
-    #   - The google-generativeai SDK has a known bug where generate_content_async
-    #     sometimes returns a non-awaitable response (issue #732 on the deprecated
-    #     repo). The sync API is rock-solid, so we use it from threads.
-    #   - FastAPI endpoint stays sync, no async refactor needed.
+    # Why sequential over parallel?
+    #   - Pass 3 (curve) is the heaviest and repeatedly 504-timed out in
+    #     production, even after the 100→50 point reduction and the
+    #     25s→60s timeout bump. Our hypothesis: parallel execution puts
+    #     3 concurrent requests on the same (overloaded) Google endpoint
+    #     queue at once, and Pass 3 — the longest — is the most likely
+    #     victim of server-side deadline exhaustion.
+    #   - Pass 1 (metadata) and Pass 2 (NaR) consistently succeed within
+    #     10-20s each. By running them first, sequentially, we free up
+    #     Google-side capacity for Pass 3 by the time it fires.
+    #   - Sequential also enables GRACEFUL DEGRADATION: if Pass 1 fails
+    #     we abort immediately (no wasted calls); if Pass 2 fails the
+    #     slide still renders from metadata; if Pass 3 fails we keep
+    #     metadata + NaR.
     #
-    # Why three separate workers (not asyncio.gather)?
-    #   - Future.result(timeout=N) gives us a hard wall-clock ceiling that does
-    #     NOT depend on the SDK's internal timeout being honoured.
-    #   - If a thread hangs in C-level code (rare but happens with grpc), the
-    #     thread is leaked but the request still returns — we don't block the
-    #     entire chart-service.
+    # Cost: wall time rises from ~60s (max of three) to ~90-120s (sum).
+    # Still well within Railway's 300s edge timeout. For an on-demand
+    # extraction the user is waiting on, this is an acceptable trade.
     #
-    # Total wall time = max(pass1, pass2, pass3) instead of sum.
-    # In practice this cuts the 3-pass worst case from ~150s to ~50s.
-    # Gemini free tier allows 15 req/sec so 3 concurrent requests is fine.
+    # We keep the _run_pass helper (with its per-call watchdog, retry,
+    # and fallback-model logic) — it's already single-request-safe and
+    # doesn't need changes for sequential use. The executor wrapping is
+    # what goes away.
     # ──────────────────────────────────────────────────────────────
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=3, thread_name_prefix="km-vision"
+    deadline = time.monotonic() + GEMINI_TOTAL_EXTRACTION_SECONDS
+
+    def _remaining_budget() -> float:
+        """Remaining wall-clock budget before the total watchdog fires."""
+        return max(0.0, deadline - time.monotonic())
+
+    def _run_pass_with_deadline(prompt, label):
+        """Run one pass. If the total deadline has already fired, skip this
+        pass entirely and return a watchdog-timeout result — no point
+        starting a call that can't complete within budget."""
+        if _remaining_budget() < 2.0:
+            logger.error(
+                f"{label}: total watchdog ({GEMINI_TOTAL_EXTRACTION_SECONDS}s) "
+                f"expired before this pass could start — skipping"
+            )
+            return (
+                None, GEMINI_PRIMARY_MODEL,
+                f"Total watchdog expired before {label} started",
+            )
+        return _run_pass(genai, png_bytes, prompt, label, source_hint)
+
+    # ---- Pass 1: Metadata (title, arms, HR, axis ranges) ----
+    # Runs first because: (a) without metadata we can't validate or render
+    # anything, so early failure here means we abort the whole extraction;
+    # (b) it's the lightest pass (typically 10-15s), so we spend little
+    # budget even in the pathological case.
+    logger.info(f"Running Pass 1 (metadata) sequentially for source='{source_hint}'")
+    metadata_data, metadata_model, metadata_error = _run_pass_with_deadline(
+        METADATA_PROMPT, "Pass 1 (metadata)"
     )
-    try:
-        future_metadata = executor.submit(
-            _run_pass, genai, png_bytes, METADATA_PROMPT, "metadata", source_hint
-        )
-        future_nar = executor.submit(
-            _run_pass, genai, png_bytes, NAR_PROMPT, "NaR", source_hint
-        )
-        future_curve = executor.submit(
-            _run_pass, genai, png_bytes, CURVE_PROMPT, "curve", source_hint
-        )
 
-        # Watchdog on each future. The three futures run in parallel, so we
-        # use a SHARED deadline (wall-clock) rather than three independent
-        # 75s budgets. Otherwise hung passes would total 225s before we return
-        # — defeats the purpose of "total budget".
-        deadline = time.monotonic() + GEMINI_TOTAL_EXTRACTION_SECONDS
-
-        def _result_with_deadline(future, label: str) -> tuple:
-            remaining = max(0.1, deadline - time.monotonic())
-            try:
-                return future.result(timeout=remaining)
-            except concurrent.futures.TimeoutError:
-                logger.error(
-                    f"{label} exceeded total watchdog "
-                    f"({GEMINI_TOTAL_EXTRACTION_SECONDS}s shared deadline) "
-                    f"for source='{source_hint}'"
-                )
-                return (
-                    None, GEMINI_PRIMARY_MODEL,
-                    f"Watchdog timeout after {GEMINI_TOTAL_EXTRACTION_SECONDS}s",
-                )
-
-        metadata_data, metadata_model, metadata_error = _result_with_deadline(
-            future_metadata, "Pass 1 (metadata)"
-        )
-        nar_data, nar_model, nar_error = _result_with_deadline(
-            future_nar, "Pass 2 (NaR)"
-        )
-        curve_data, curve_model, curve_error = _result_with_deadline(
-            future_curve, "Pass 3 (curve)"
-        )
-    finally:
-        # Don't wait for stuck threads — they will exit eventually.
-        # Workers are daemon-by-default in ThreadPoolExecutor on Python 3.9+.
-        executor.shutdown(wait=False)
-
-    # If metadata extraction failed entirely, we have no usable output —
-    # NaR and curves alone are meaningless without arm names/medians.
+    # ---- Early-abort on metadata failure ----
+    # Unlike the parallel version, we abort here BEFORE wasting budget on
+    # NaR and Curve passes that would produce unusable output without arm
+    # names / axis ranges.
     if metadata_error and not metadata_data:
+        logger.error(
+            f"Pass 1 (metadata) failed — aborting extraction. "
+            f"NaR/curve passes skipped to save budget. Error: {metadata_error}"
+        )
         return _empty_result(
             error=f"Pass 1 (metadata) failed: {metadata_error}",
             metadata_model=metadata_model,
-            nar_model=nar_model,
-            curve_model=curve_model,
         )
+
+    # ---- Pass 2: Number-at-Risk table ----
+    # Runs second. Soft-fail is acceptable: a KM slide without NaR is still
+    # informative; the renderer simply omits the per-time-point counts strip.
+    logger.info(
+        f"Pass 1 (metadata) complete in {GEMINI_TOTAL_EXTRACTION_SECONDS - _remaining_budget():.1f}s — "
+        f"running Pass 2 (NaR)"
+    )
+    nar_data, nar_model, nar_error = _run_pass_with_deadline(
+        NAR_PROMPT, "Pass 2 (NaR)"
+    )
+
+    # ---- Pass 3: Curve coordinates ----
+    # Runs last so that (a) earlier passes succeeded under lighter API load,
+    # (b) Pass 3 gets whatever budget remains — typically 90-120s if
+    # Pass 1 + Pass 2 were healthy.
+    logger.info(
+        f"Pass 2 (NaR) complete, remaining budget {_remaining_budget():.1f}s — "
+        f"running Pass 3 (curve)"
+    )
+    curve_data, curve_model, curve_error = _run_pass_with_deadline(
+        CURVE_PROMPT, "Pass 3 (curve)"
+    )
 
     # Defensive: Gemini occasionally returns a JSON list at the top level
     # instead of the object we asked for (schema violation). The rest of
