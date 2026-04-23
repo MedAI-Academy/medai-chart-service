@@ -492,6 +492,21 @@ def extract_km_vision(
             curve_model=curve_model,
         )
 
+    # Defensive: Gemini occasionally returns a JSON list at the top level
+    # instead of the object we asked for (schema violation). The rest of
+    # this function assumes metadata_data is a dict (or None), so we
+    # coerce any non-dict shape to None and treat it as a soft failure.
+    # This was observed 2026-04-23 during a VIALE-A run that crashed with
+    # "'list' object has no attribute 'get'" at the _validate_arms call.
+    if metadata_data is not None and not isinstance(metadata_data, dict):
+        logger.warning(
+            f"Pass 1 (metadata) returned non-dict type "
+            f"{type(metadata_data).__name__} instead of object — "
+            f"treating as empty metadata. Raw start: "
+            f"{str(metadata_data)[:200]!r}"
+        )
+        metadata_data = None
+
     # ---- Validate, normalise, cross-check ----
     arms_validated, arms_dropped = _validate_arms(metadata_data.get("arms") if metadata_data else [])
     nar_validated, nar_dropped = _validate_nar(
